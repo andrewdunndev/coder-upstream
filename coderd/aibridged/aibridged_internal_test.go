@@ -145,7 +145,7 @@ func TestNewRecorder(t *testing.T) {
 		} {
 			// A previously recorded identity must not be reused as a fallback.
 			err := rec.RecordInterception(ctx, &recorder.InterceptionRecord{ID: uuid.NewString(), InitiatorID: uuid.NewString(), StartedAt: now})
-			require.ErrorIs(t, err, recorder.ErrMissingAPIKeyID, name)
+			require.ErrorIs(t, err, aibcontext.ErrMissingAPIKeyID, name)
 		}
 		requireRecordedIdentities(t, sink, client, valid)
 
@@ -596,7 +596,6 @@ func newProxyTestRouter(t *testing.T, upstreamHandler http.Handler, gate *aibrid
 	router, err := proxy.NewRouter([]aibridge.Provider{aibridge.NewOpenAIProvider(config.OpenAI{BaseURL: upstream.URL})},
 		slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), gate)
 	require.NoError(t, err)
-	t.Cleanup(router.CloseIdleConnections)
 	return router
 }
 

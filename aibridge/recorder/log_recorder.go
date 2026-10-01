@@ -6,6 +6,7 @@ import (
 	"maps"
 
 	"cdr.dev/slog/v3"
+	aibcontext "github.com/coder/coder/v2/aibridge/context"
 	"github.com/coder/coder/v2/coderd/util/ptr"
 )
 
@@ -98,7 +99,7 @@ func (r *LogRecorder) marshalToolArgs(ctx context.Context, args ToolArgs) string
 }
 
 func (r *LogRecorder) RecordInterception(ctx context.Context, req *InterceptionRecord) error {
-	apiKeyID, err := apiKeyIDFromContext(ctx)
+	apiKeyID, err := aibcontext.APIKeyIDFromContext(ctx)
 	if err != nil {
 		return err
 	}

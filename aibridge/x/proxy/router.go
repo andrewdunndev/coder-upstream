@@ -30,8 +30,7 @@ type Router struct {
 	mux *http.ServeMux
 
 	// providers is an owned copy of the provider list, fixed at construction.
-	providers  []provider.Provider
-	transports []*http.Transport
+	providers []provider.Provider
 }
 
 var _ http.Handler = (*Router)(nil)
@@ -91,12 +90,4 @@ func (p *Router) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 // KeyPools returns the non-nil key pools from this router's provider snapshot.
 func (p *Router) KeyPools() []*keypool.Pool {
 	return provider.CollectKeyPools(p.providers)
-}
-
-// CloseIdleConnections releases idle connections owned by bridged forwarding.
-// Active requests retain their connections until they finish.
-func (p *Router) CloseIdleConnections() {
-	for _, transport := range p.transports {
-		transport.CloseIdleConnections()
-	}
 }

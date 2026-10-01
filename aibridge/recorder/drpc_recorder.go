@@ -17,21 +17,9 @@ import (
 
 var _ Recorder = &DRPCRecorder{}
 
-// ErrMissingAPIKeyID indicates that an interception's context lacks a verified
-// API-key ID. Recorders never retain identity between calls.
-var ErrMissingAPIKeyID = xerrors.New("missing authenticated API-key ID")
-
 // DRPCRecorder satisfies the Recorder interface and translates calls into dRPC calls to aibridgedserver.
 type DRPCRecorder struct {
 	clientFn func(context.Context) (proto.DRPCRecorderClient, error)
-}
-
-func apiKeyIDFromContext(ctx context.Context) (string, error) {
-	actor := aibcontext.ActorFromContext(ctx)
-	if actor == nil || actor.APIKeyID == "" {
-		return "", ErrMissingAPIKeyID
-	}
-	return actor.APIKeyID, nil
 }
 
 // client resolves the client to use for a single record call. A DRPCRecorder
@@ -47,7 +35,7 @@ func (t *DRPCRecorder) client(ctx context.Context) (proto.DRPCRecorderClient, er
 }
 
 func (t *DRPCRecorder) RecordInterception(ctx context.Context, req *InterceptionRecord) error {
-	apiKeyID, err := apiKeyIDFromContext(ctx)
+	apiKeyID, err := aibcontext.APIKeyIDFromContext(ctx)
 	if err != nil {
 		return err
 	}
