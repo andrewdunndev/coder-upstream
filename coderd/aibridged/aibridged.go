@@ -404,12 +404,15 @@ func (s *Server) isShutdown() bool {
 func (s *Server) Shutdown(ctx context.Context) error {
 	var err error
 	s.shutdownOnce.Do(func() {
-		s.cancelFn(ErrShutdown)
-
 		// Sockets outlive the bridges in the pool, so they are ended here.
+		// They end before the lifecycle does: canceling it closes the coderd
+		// connection, and a closing socket still records its last usage and
+		// interception ends through Client.
 		if drainErr := s.sockets.Shutdown(ctx); drainErr != nil {
 			s.logger.Debug(ctx, "shutdown deadline passed with Responses WebSockets open", slog.Error(drainErr))
 		}
+
+		s.cancelFn(ErrShutdown)
 
 		// Wait for any outstanding connections to terminate.
 		s.wg.Wait()
