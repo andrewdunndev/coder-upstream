@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/routing"
 	"github.com/coder/coder/v2/aibridge/x/proxy"
+	codertestutil "github.com/coder/coder/v2/testutil"
 )
 
 type keyPoolProvider struct {
@@ -195,21 +197,79 @@ passthrough_total{method="GET",provider="test",route="/tokens"} 1
 `)))
 }
 
-func TestRouterBridgedRemainsStubbed(t *testing.T) {
+// Only lifecycle methods are implemented; content recording must not occur.
+type routerRecorder struct {
+	recorder.Recorder
+	starts []recorder.InterceptionRecord
+	ends   []recorder.InterceptionRecordEnded
+	done   chan struct{}
+}
+
+func (r *routerRecorder) RecordInterception(_ context.Context, record *recorder.InterceptionRecord) error {
+	r.starts = append(r.starts, *record)
+	return nil
+}
+
+func (r *routerRecorder) RecordInterceptionEnded(_ context.Context, record *recorder.InterceptionRecordEnded) error {
+	r.ends = append(r.ends, *record)
+	close(r.done)
+	return nil
+}
+
+func TestRouterRecordedForwardingIsolation(t *testing.T) {
 	t.Parallel()
-	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("bridged forwarding must remain disabled until lifecycle recording is connected")
+	var connections atomic.Int32
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Contains(t, []string{"/chat/completions", "/responses"}, r.URL.Path)
+		_, _ = io.Copy(w, r.Body)
 	}))
+	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	upstream.Start()
 	t.Cleanup(upstream.Close)
-	router, err := proxy.NewRouter([]provider.Provider{provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL})}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
+	m := metrics.NewMetrics(prometheus.NewRegistry())
+	router, err := proxy.NewRouter([]provider.Provider{provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL})}, slogtest.Make(t, nil), m, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
 	require.NoError(t, err)
 	t.Cleanup(router.CloseIdleConnections)
-	ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
-	req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer user-key")
-	response := httptest.NewRecorder()
-	router.Serve(response, req, &struct{ recorder.Recorder }{})
-	require.Equal(t, http.StatusNotFound, response.Code)
+	request := func(t *testing.T, route, actor string) {
+		t.Helper()
+		rec := &routerRecorder{done: make(chan struct{})}
+		ctx := aibcontext.AsActor(t.Context(), actor, "", nil)
+		req := httptest.NewRequest(http.MethodPost, "/openai/v1"+route, strings.NewReader(actor)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+actor)
+		response := httptest.NewRecorder()
+		router.Serve(response, req, rec)
+		codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done)
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, actor, response.Body.String())
+		require.Len(t, rec.starts, 1)
+		require.Len(t, rec.ends, 1)
+		require.Equal(t, actor, rec.starts[0].InitiatorID)
+		require.NotEmpty(t, rec.starts[0].ID)
+		require.Equal(t, rec.starts[0].ID, rec.ends[0].ID)
+		require.Empty(t, rec.starts[0].Model)
+		require.Empty(t, rec.ends[0].ErrorType)
+		require.Equal(t, 1.0, promtestutil.ToFloat64(m.InterceptionCount.WithLabelValues("openai", "", "completed", "/v1"+route, http.MethodPost, actor, "Unknown")))
+	}
+	request(t, "/chat/completions", "first-actor")
+	request(t, "/responses", "second-actor")
+	require.EqualValues(t, 1, connections.Load(), "bridged routes share one transport")
+	router.CloseIdleConnections()
+	request(t, "/responses", "after-close")
+	require.EqualValues(t, 2, connections.Load(), "owned transport idle connections are closed")
+	require.Zero(t, promtestutil.CollectAndCount(m.PassthroughCount))
+	t.Run("Concurrent", func(t *testing.T) {
+		t.Parallel()
+		for i := range 8 {
+			t.Run(fmt.Sprint(i), func(t *testing.T) {
+				t.Parallel()
+				request(t, "/chat/completions", t.Name())
+			})
+		}
+	})
 }
 
 func TestRouterBedrockBridgedRemainsDisabled(t *testing.T) {
@@ -226,12 +286,15 @@ func TestRouterBedrockBridgedRemainsDisabled(t *testing.T) {
 	router, err := proxy.NewRouter([]provider.Provider{prov}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
 	require.NoError(t, err)
 	t.Cleanup(router.CloseIdleConnections)
+	rec := &routerRecorder{}
 	ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
 	for _, route := range prov.BridgedRoutes() {
 		response := httptest.NewRecorder()
-		router.Serve(response, httptest.NewRequest(http.MethodPost, prov.RoutePrefix()+route, nil).WithContext(ctx), &struct{ recorder.Recorder }{})
+		router.Serve(response, httptest.NewRequest(http.MethodPost, prov.RoutePrefix()+route, nil).WithContext(ctx), rec)
 		require.Equal(t, http.StatusNotFound, response.Code)
 	}
+	require.Empty(t, rec.starts)
+	require.Empty(t, rec.ends)
 }
 
 // TestRouterSnapshotsProviders asserts the router routes and reports key

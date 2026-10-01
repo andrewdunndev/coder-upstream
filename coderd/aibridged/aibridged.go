@@ -45,8 +45,9 @@ type Server struct {
 	backend   atomic.Pointer[backend]
 	backendMu sync.Mutex
 
-	// inflight tracks proxy requests across router snapshots. Shutdown waits
-	// for completion or cancels their contexts when its deadline expires.
+	// inflight tracks proxy requests and their processing tasks across router
+	// snapshots. Shutdown waits for completion or cancels their contexts when
+	// its deadline expires.
 	inflight *aibridge.InflightGate
 
 	// reverseProxyExp is the experiment flag. Proxy mode also requires no MCP configs.
@@ -263,7 +264,7 @@ func (s *Server) initializeBackend(ctx context.Context, client DRPCClient) error
 
 	// Otherwise, use proxy mode.
 	s.backend.Store(&backend{})
-	s.logger.Warn(ctx, "reverse proxy routing is not yet functional")
+	s.logger.Warn(ctx, "experimental proxy mode records request lifecycle only; model and token accounting are not yet supported")
 	return nil
 }
 

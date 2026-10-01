@@ -13,7 +13,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/xerrors"
 
@@ -25,11 +29,13 @@ import (
 	"github.com/coder/coder/v2/aibridge/credential"
 	"github.com/coder/coder/v2/aibridge/headers"
 	"github.com/coder/coder/v2/aibridge/intercept/apidump"
+	"github.com/coder/coder/v2/aibridge/interceptionerror"
 	"github.com/coder/coder/v2/aibridge/keypool"
 	"github.com/coder/coder/v2/aibridge/metrics"
 	"github.com/coder/coder/v2/aibridge/provider"
 	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/routing"
+	"github.com/coder/coder/v2/aibridge/tracing"
 	"github.com/coder/coder/v2/aibridge/utils"
 	"github.com/coder/quartz"
 )
@@ -107,22 +113,58 @@ func prepareForwardingHeaders(pr *httputil.ProxyRequest) http.Header {
 }
 
 func (h *forwardingHandler) serve(w http.ResponseWriter, r *http.Request, rec recorder.Recorder) {
+	start := time.Now()
 	release, ok := h.inflight.Admit()
 	if !ok {
 		http.Error(w, "AI Gateway is shutting down", http.StatusServiceUnavailable)
 		return
 	}
-	defer release()
 	ctx, cleanup := h.inflight.RequestContext(r.Context())
-	defer cleanup()
 	ctx, span := h.tracer.Start(ctx, "Proxy")
+	processCtx, cleanupProcess := h.inflight.RequestContext(context.WithoutCancel(ctx))
+	tasks := utils.NewConcurrentGroup()
+	defer func() {
+		go func() {
+			defer release()
+			defer cleanupProcess()
+			if err := tasks.Wait(); err != nil {
+				h.logger.Warn(processCtx, "proxy request processing failed", slog.Error(err))
+			}
+		}()
+	}()
+	defer cleanup()
 	defer span.End()
-	if record, _ := h.checkRequest(w, r.WithContext(ctx), rec); record == nil {
+	r = r.WithContext(ctx)
+	record, cred := h.checkRequest(w, r, rec)
+	if record == nil {
 		return
 	}
+	record.ID, record.StartedAt = uuid.NewString(), start.UTC()
+	fields := []slog.Field{slog.F("interception_id", record.ID), slog.F("provider", h.provider.Name()), slog.F("credential_kind", string(cred.Kind()))}
+	ctx = slog.With(ctx, fields...)
+	processCtx = slog.With(processCtx, append(fields, slog.F("method", r.Method), slog.F("path", r.URL.Path))...)
+	span.SetAttributes(attribute.String(tracing.InterceptionID, record.ID), attribute.String(tracing.InitiatorID, record.InitiatorID), attribute.String(tracing.Provider, h.provider.Name()))
+	state := &responseObservation{credentialHint: record.CredentialHint}
+	forward, body := h.prepareForwarding(r.WithContext(context.WithValue(ctx, observationContextKey{}, state)), cred)
+	started := make(chan error, 1)
+	finished := make(chan recorder.InterceptionRecordEnded, 1)
+	request := r.Clone(processCtx)
+	request.Body, request.GetBody = nil, nil
+	tasks.Go(func() error { return h.processRequest(processCtx, request, rec, *record, body, started) })
+	tasks.Go(func() error { return h.processResponse(processCtx, rec, started, finished) })
 
-	// TODO: connect forwarding with lifecycle recording.
-	http.NotFound(w, r)
+	route := strings.TrimPrefix(r.Pattern, "/"+h.provider.Name())
+	if h.metrics != nil {
+		h.metrics.InterceptionsInflight.WithLabelValues(h.provider.Name(), "", route).Inc()
+	}
+	defer func() {
+		panicValue := recover()
+		h.finishForwarding(ctx, r, start, record, body, state, finished, panicValue)
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
+	h.forward(w, forward, body, state)
 }
 
 func (h *forwardingHandler) checkRequest(w http.ResponseWriter, r *http.Request, rec recorder.Recorder) (*recorder.InterceptionRecord, credential.Credential) {
@@ -233,6 +275,99 @@ func (h *forwardingHandler) forward(w http.ResponseWriter, r *http.Request, body
 		}
 		return state.err
 	})
+}
+
+func (h *forwardingHandler) processRequest(ctx context.Context, r *http.Request, rec recorder.Recorder, record recorder.InterceptionRecord, body *requestBuffer, started chan<- error) (outErr error) {
+	defer func() {
+		if recover() != nil {
+			outErr = xerrors.New("request processing panicked")
+		}
+		started <- outErr
+	}()
+	select {
+	case capture := <-body.captured:
+		if capture.err == nil {
+			record.ClientSessionID = aibclient.GuessSessionIDFromPayload(aibclient.Type(record.Client), r, capture.payload)
+		} else {
+			h.logger.Debug(ctx, "request body metadata unavailable", slog.Error(capture.err))
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, recorder.DefaultAsyncTimeout)
+	defer cancel()
+	if err := rec.RecordInterception(recordCtx, &record); err != nil {
+		return xerrors.Errorf("record interception: %w", err)
+	}
+	return nil
+}
+
+func (*forwardingHandler) processResponse(ctx context.Context, rec recorder.Recorder, started <-chan error, finished <-chan recorder.InterceptionRecordEnded) (outErr error) {
+	defer func() {
+		if recover() != nil {
+			outErr = xerrors.New("response processing panicked")
+		}
+	}()
+	var record recorder.InterceptionRecordEnded
+	select {
+	case record = <-finished:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-started:
+		if err != nil {
+			return nil // The start job reports its error; there is no row to update.
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	recordCtx, cancel := context.WithTimeout(ctx, recorder.DefaultAsyncTimeout)
+	defer cancel()
+	if err := rec.RecordInterceptionEnded(recordCtx, &record); err != nil {
+		return xerrors.Errorf("record interception end: %w", err)
+	}
+	return nil
+}
+
+// finishForwarding publishes an immutable outcome without waiting for processing.
+func (h *forwardingHandler) finishForwarding(ctx context.Context, r *http.Request, start time.Time, record *recorder.InterceptionRecord, body *requestBuffer, state *responseObservation, finished chan<- recorder.InterceptionRecordEnded, panicValue any) {
+	end := time.Now()
+	terminal := state.err
+	body.mu.Lock()
+	requestErr := body.err
+	body.mu.Unlock()
+	if terminal == nil && state.status < http.StatusBadRequest && !errors.Is(requestErr, io.EOF) {
+		terminal = requestErr
+	}
+	if terminal == nil && ctx.Err() != nil && (state.body == nil || !state.body.eof) {
+		terminal = ctx.Err()
+	}
+	if terminal == nil && state.body != nil {
+		terminal = state.body.readErr
+	}
+	if terminal == nil && panicValue != nil {
+		terminal = xerrors.New("response stream aborted")
+	}
+	errType, message := interceptionerror.Categorize(h.provider, terminal)
+	if _, ok := errors.AsType[*http.MaxBytesError](terminal); ok {
+		errType = recorder.ErrorTypeBadRequest
+	}
+	if terminal == nil && state.status >= http.StatusBadRequest {
+		errType, message = recorder.ErrorTypeFromStatus(state.status), http.StatusText(state.status)
+	}
+	status := metrics.InterceptionCountStatusCompleted
+	if errType != "" {
+		status = metrics.InterceptionCountStatusFailed
+		trace.SpanFromContext(ctx).SetStatus(codes.Error, message)
+	}
+	if h.metrics != nil {
+		route := strings.TrimPrefix(r.Pattern, "/"+h.provider.Name())
+		h.metrics.InterceptionsInflight.WithLabelValues(h.provider.Name(), "", route).Dec()
+		h.metrics.InterceptionDuration.WithLabelValues(h.provider.Name(), "").Observe(end.Sub(start).Seconds())
+		h.metrics.InterceptionCount.WithLabelValues(h.provider.Name(), "", status, route, r.Method, record.InitiatorID, record.Client).Inc()
+	}
+	finished <- recorder.InterceptionRecordEnded{ID: record.ID, EndedAt: end.UTC(), CredentialHint: state.credentialHint, ErrorType: errType, ErrorMessage: message}
 }
 
 // RoundTrip observes only the final response returned by key failover. Its

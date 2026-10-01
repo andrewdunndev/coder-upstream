@@ -46,9 +46,10 @@ type route struct {
 // names must be valid and unique.
 //
 // Each configured-but-disabled provider serves a 503 sentinel on every path
-// under its name. Enabled providers use the existing passthrough handler for
-// passthrough routes; bridged routes validate requests but still return 404.
-// All snapshots share the server's inflight gate so shutdown drains their requests.
+// under its name. Passthrough routes use the existing passthrough handler.
+// Bridged routes require an actor on the request context and a recorder supplied
+// to Serve. Bedrock bridged routes remain unsupported. All router snapshots
+// must share the server's inflight gate so shutdown drains their requests.
 func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Metrics, tracer trace.Tracer, inflight *aibridge.InflightGate) (_ *Router, outErr error) {
 	if err := provider.ValidateProviders(providers); err != nil {
 		return nil, err
@@ -102,7 +103,7 @@ func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Met
 }
 
 // Serve dispatches a request with its authenticated recorder. Each handler owns
-// its admission lifetime. Passthrough routes do not need rec.
+// its admission and processing lifetime. Passthrough routes do not need rec.
 func (p *Router) Serve(rw http.ResponseWriter, r *http.Request, rec recorder.Recorder) {
 	if r.Body != nil && r.Body != http.NoBody {
 		r.Body = http.MaxBytesReader(rw, r.Body, routing.MaxRequestBodyBytes)

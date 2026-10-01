@@ -2,6 +2,7 @@ package aibridged
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/aibridge/config"
 	"github.com/coder/coder/v2/aibridge/keypool"
+	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/x/proxy"
 	"github.com/coder/coder/v2/testutil"
 	"github.com/coder/quartz"
@@ -107,6 +109,57 @@ type shutdownPool struct {
 
 func (p *shutdownPool) Shutdown(ctx context.Context) error { return p.shutdown(ctx) }
 
+// endSignalRecorder accepts lifecycle records and reports the final one.
+type endSignalRecorder struct {
+	recorder.Recorder
+	ended chan struct{}
+}
+
+func (endSignalRecorder) RecordInterception(context.Context, *recorder.InterceptionRecord) error {
+	return nil
+}
+
+func (r endSignalRecorder) RecordInterceptionEnded(context.Context, *recorder.InterceptionRecordEnded) error {
+	close(r.ended)
+	return nil
+}
+
+// newIdleProxyRouter establishes an idle bridged connection through gate and
+// waits for its processing to finish. Other requests use passthrough so tests
+// can hold an active request while retiring the idle one.
+func newIdleProxyRouter(t *testing.T, passthrough http.Handler, gate *aibridge.InflightGate) (*proxy.Router, <-chan struct{}) {
+	t.Helper()
+	closed := make(chan struct{})
+	markClosed := sync.OnceFunc(func() { close(closed) })
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/chat/completions" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		passthrough.ServeHTTP(w, r)
+	}))
+	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			markClosed()
+		}
+	}
+	upstream.Start()
+	t.Cleanup(upstream.Close)
+	logger, tracer := slogtest.Make(t, nil), otel.Tracer(t.Name())
+	router, err := proxy.NewRouter([]aibridge.Provider{aibridge.NewOpenAIProvider(config.OpenAI{BaseURL: upstream.URL})}, logger, nil, tracer, gate)
+	require.NoError(t, err)
+	t.Cleanup(router.CloseIdleConnections)
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer provider-key")
+	req = req.WithContext(aibridge.AsActor(t.Context(), t.Name(), "", nil))
+	rec := endSignalRecorder{ended: make(chan struct{})}
+	response := httptest.NewRecorder()
+	router.Serve(response, req, rec)
+	require.Equal(t, http.StatusNoContent, response.Code)
+	testutil.TryReceive(testutil.Context(t, testutil.WaitShort), t, rec.ended)
+	return router, closed
+}
+
 func TestServerShutdownMode(t *testing.T) {
 	t.Parallel()
 	poolErr := xerrors.New("pool shutdown failed")
@@ -127,6 +180,7 @@ func TestServerShutdownMode(t *testing.T) {
 			lifecycleCtx, cancel := context.WithCancelCause(t.Context())
 			defer cancel(nil)
 			calls := 0
+			var idleClosed <-chan struct{}
 			pool := &shutdownPool{shutdown: func(got context.Context) error {
 				require.Equal(t, ctx, got)
 				calls++
@@ -141,6 +195,8 @@ func TestServerShutdownMode(t *testing.T) {
 				current := &backend{}
 				if tc.interception {
 					current.pool = pool
+				} else {
+					current.router, idleClosed = newIdleProxyRouter(t, http.NotFoundHandler(), server.inflight)
 				}
 				server.backend.Store(current)
 			}
@@ -157,6 +213,9 @@ func TestServerShutdownMode(t *testing.T) {
 			}
 			_ = server.Shutdown(ctx)
 			require.Equal(t, expectedCalls, calls, "owned pool is shut down only once")
+			if idleClosed != nil {
+				testutil.TryReceive(ctx, t, idleClosed)
+			}
 		})
 	}
 }
@@ -199,17 +258,55 @@ func TestServerShutdownDoesNotWaitForStalledConnectLoop(t *testing.T) {
 	testCtx := testutil.Context(t, testutil.WaitShort)
 	testutil.TryReceive(testCtx, t, dialStarted)
 
+	router, idleClosed := newIdleProxyRouter(t, http.NotFoundHandler(), server.inflight)
+	server.backend.Store(&backend{router: router})
 	shutdownCtx, cancelShutdown := context.WithCancel(t.Context())
 	cancelShutdown()
 	shutdownDone := make(chan error, 1)
 	go func() { shutdownDone <- server.Shutdown(shutdownCtx) }()
 	require.ErrorIs(t, testutil.RequireReceive(testCtx, t, shutdownDone), context.Canceled)
 	require.ErrorIs(t, context.Cause(lifecycleCtx), ErrShutdown)
+	testutil.TryReceive(testCtx, t, idleClosed)
 	select {
 	case <-connectDone:
 		t.Fatal("connect loop exited before the stalled dial was released")
 	default:
 	}
+}
+
+func TestReplaceProvidersClosesRetiredIdleConnections(t *testing.T) {
+	t.Parallel()
+	handler, started, release := blockingHandler()
+	release = sync.OnceFunc(release)
+	defer release()
+	server := newProxyTestServer(t, http.NotFoundHandler())
+	router, idleClosed := newIdleProxyRouter(t, handler, server.inflight)
+	server.backend.Store(&backend{router: router})
+	ctx := testutil.Context(t, testutil.WaitShort)
+	retained, err := server.GetRequestHandler(ctx, Request{})
+	require.NoError(t, err)
+	done := serveAsync(retained)
+	testutil.RequireReceive(ctx, t, started)
+
+	err = server.ReplaceProviders(ctx, []aibridge.Provider{aibridge.NewOpenAIProvider(config.OpenAI{Name: "invalid/name"})})
+	require.Error(t, err)
+	require.Same(t, router, server.backend.Load().router, "failed construction must retain the current router")
+	select {
+	case <-idleClosed:
+		t.Fatal("failed construction retired the current router's idle connection")
+	default:
+	}
+	require.NoError(t, server.ReplaceProviders(ctx, nil))
+	require.NotSame(t, router, server.backend.Load().router)
+	testutil.TryReceive(ctx, t, idleClosed)
+	select {
+	case <-done:
+		t.Fatal("retiring idle connections interrupted an admitted request")
+	default:
+	}
+	release()
+	require.Equal(t, http.StatusNoContent, testutil.RequireReceive(ctx, t, done))
+	require.NoError(t, server.Shutdown(ctx))
 }
 
 type blockingNameProvider struct {
