@@ -12,6 +12,7 @@ import (
 
 	"cdr.dev/slog/v3"
 	"github.com/coder/coder/v2/aibridge"
+	"github.com/coder/coder/v2/aibridge/config"
 	"github.com/coder/coder/v2/aibridge/keypool"
 	"github.com/coder/coder/v2/aibridge/metrics"
 	"github.com/coder/coder/v2/aibridge/provider"
@@ -60,15 +61,17 @@ func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Met
 			continue
 		}
 
-		bridged := inflight.Middleware(newForwardingHandler(prov, logger, tracer))
+		notFound := inflight.Middleware(http.NotFoundHandler())
+		bridged := func(w http.ResponseWriter, r *http.Request, _ recorder.Recorder) { notFound.ServeHTTP(w, r) }
+		if prov.Type() != config.ProviderBedrock && len(prov.BridgedRoutes()) > 0 {
+			bridged = newForwardingHandler(prov, logger, tracer, inflight).serve
+		}
 		for _, path := range prov.BridgedRoutes() {
 			pattern, err := url.JoinPath(prov.RoutePrefix(), path)
 			if err != nil {
 				return nil, xerrors.Errorf("configure provider %q bridged route: %w", prov.Name(), err)
 			}
-			router.routes = append(router.routes, route{pattern: pattern, serve: func(w http.ResponseWriter, r *http.Request, _ recorder.Recorder) {
-				bridged.ServeHTTP(w, r)
-			}})
+			router.routes = append(router.routes, route{pattern: pattern, serve: bridged})
 		}
 
 		passthrough := inflight.Middleware(http.StripPrefix(prov.RoutePrefix(), aibridge.NewPassthroughRouter(prov, logger.Named(fmt.Sprintf("passthrough.%s", prov.Name())), m, tracer)))

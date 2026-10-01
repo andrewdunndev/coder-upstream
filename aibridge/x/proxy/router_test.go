@@ -19,10 +19,12 @@ import (
 	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/aibridge/config"
+	aibcontext "github.com/coder/coder/v2/aibridge/context"
 	"github.com/coder/coder/v2/aibridge/internal/testutil"
 	"github.com/coder/coder/v2/aibridge/keypool"
 	"github.com/coder/coder/v2/aibridge/metrics"
 	"github.com/coder/coder/v2/aibridge/provider"
+	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/routing"
 	"github.com/coder/coder/v2/aibridge/x/proxy"
 )
@@ -111,7 +113,7 @@ func TestRouterDisabledProvider(t *testing.T) {
 		{name: "DisabledBridgedRoute", path: "/disabled-openai/v1/chat/completions", wantStatus: http.StatusServiceUnavailable, wantBody: routing.ErrorCodeProviderDisabled},
 		{name: "DisabledPassthroughRoute", path: "/disabled-openai/v1/models", wantStatus: http.StatusServiceUnavailable, wantBody: routing.ErrorCodeProviderDisabled},
 		{name: "DisabledUnknownRoute", path: "/disabled-openai/anything/else", wantStatus: http.StatusServiceUnavailable, wantBody: routing.ErrorCodeProviderDisabled},
-		{name: "EnabledBridgedRoute", path: "/openai/v1/chat/completions", wantStatus: http.StatusNotFound, wantBody: "404 page not found"},
+		{name: "EnabledBridgedRoute", path: "/openai/v1/chat/completions", wantStatus: http.StatusBadRequest, wantBody: "actor"},
 		{name: "EnabledPassthroughRoute", path: "/openai/v1/models", wantStatus: http.StatusOK, wantBody: "upstream"},
 		{name: "UnknownEnabledRoute", path: "/openai/admin", wantStatus: http.StatusNotFound, wantBody: "route not supported"},
 		{name: "UnknownProvider", path: "/unknown/v1/models", wantStatus: http.StatusNotFound, wantBody: "route not supported"},
@@ -175,8 +177,7 @@ func TestRouterRegistersProviderRoutes(t *testing.T) {
 		response := httptest.NewRecorder()
 		router.Serve(response, req, nil)
 		if path == "/messages" || path == "/models/bridged" {
-			require.Equal(t, http.StatusNotFound, response.Code)
-			require.Equal(t, "404 page not found\n", response.Body.String())
+			require.Equal(t, http.StatusBadRequest, response.Code)
 			require.Zero(t, calls.Load())
 			continue
 		}
@@ -192,6 +193,45 @@ func TestRouterRegistersProviderRoutes(t *testing.T) {
 passthrough_total{method="GET",provider="test",route="/models"} 1
 passthrough_total{method="GET",provider="test",route="/tokens"} 1
 `)))
+}
+
+func TestRouterBridgedRemainsStubbed(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("bridged forwarding must remain disabled until lifecycle recording is connected")
+	}))
+	t.Cleanup(upstream.Close)
+	router, err := proxy.NewRouter([]provider.Provider{provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL})}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
+	require.NoError(t, err)
+	t.Cleanup(router.CloseIdleConnections)
+	ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer user-key")
+	response := httptest.NewRecorder()
+	router.Serve(response, req, &struct{ recorder.Recorder }{})
+	require.Equal(t, http.StatusNotFound, response.Code)
+}
+
+func TestRouterBedrockBridgedRemainsDisabled(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("Bedrock forwarding is not supported")
+	}))
+	t.Cleanup(upstream.Close)
+	prov, err := provider.NewBedrock(t.Context(), config.Anthropic{BaseURL: upstream.URL}, config.AWSBedrock{
+		Region: "us-east-1", AccessKey: "test-key", AccessKeySecret: "test-secret",
+		Model: "test-model", SmallFastModel: "test-small-model",
+	})
+	require.NoError(t, err)
+	router, err := proxy.NewRouter([]provider.Provider{prov}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
+	require.NoError(t, err)
+	t.Cleanup(router.CloseIdleConnections)
+	ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
+	for _, route := range prov.BridgedRoutes() {
+		response := httptest.NewRecorder()
+		router.Serve(response, httptest.NewRequest(http.MethodPost, prov.RoutePrefix()+route, nil).WithContext(ctx), &struct{ recorder.Recorder }{})
+		require.Equal(t, http.StatusNotFound, response.Code)
+	}
 }
 
 // TestRouterSnapshotsProviders asserts the router routes and reports key
