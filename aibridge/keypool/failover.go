@@ -17,21 +17,23 @@ type KeyFailoverConfig struct {
 
 	Logger slog.Logger
 
-	// IsBYOK returns true when the request already carries user-supplied auth.
-	// It is required whenever Pool is non-nil. BYOK requests skip key failover.
+	// IsBYOK returns true when the request already carries
+	// user-supplied auth. BYOK requests skip key failover.
 	IsBYOK func(*http.Request) bool
 
-	// InjectAuthKey writes the key value into the outbound headers in the format
-	// the provider expects. It is required whenever Pool is non-nil.
+	// InjectAuthKey writes the key value into the outbound headers
+	// in the format the provider expects.
 	InjectAuthKey func(*http.Header, string)
 
-	// BuildKeyPoolResponse renders the response sent to the client when the walker
-	// has no more keys to try. It is required whenever Pool is non-nil.
+	// BuildKeyPoolResponse renders the response sent to the client
+	// when the walker has no more keys to try.
 	BuildKeyPoolResponse func(*Error) *http.Response
 }
 
 // keyFailoverTransport retries inner across the key pool on
-// key-specific failures.
+// key-specific failures. Request bodies are replayed through GetBody when set,
+// so callers that change the body must update GetBody too. Without GetBody,
+// the body is buffered once.
 type keyFailoverTransport struct {
 	inner  http.RoundTripper
 	config KeyFailoverConfig
@@ -61,18 +63,28 @@ func (t *keyFailoverTransport) RoundTrip(req *http.Request) (*http.Response, err
 		return t.inner.RoundTrip(req)
 	}
 
-	newBody, err := bufferBody(req)
+	getBody, err := replayBody(req)
 	if err != nil {
 		return nil, err
 	}
 
 	// Fresh walker per request, independent of other inflight requests.
 	walker := t.config.Pool.Walker()
-	attempts := 0
-	defer func() { t.config.Pool.RecordAttempts(attempts) }()
+	defer func() { t.config.Pool.RecordAttempts(walker.Attempts()) }()
 	for {
+		// Prepare the body before taking a key so attempts count only sent
+		// requests.
+		if getBody != nil {
+			if req.Body, err = getBody(); err != nil {
+				return nil, err
+			}
+		}
+
 		key, keyPoolErr := walker.Next()
 		if keyPoolErr != nil {
+			if req.Body != nil {
+				_ = req.Body.Close()
+			}
 			resp := t.config.BuildKeyPoolResponse(keyPoolErr)
 			if resp == nil {
 				// Fallback if BuildKeyPoolResponse returns nil.
@@ -81,21 +93,9 @@ func (t *keyFailoverTransport) RoundTrip(req *http.Request) (*http.Response, err
 			}
 			return resp, nil
 		}
+		t.config.InjectAuthKey(&req.Header, key.Value())
 
-		// Clone per attempt so the original request isn't mutated.
-		outReq := req.Clone(req.Context())
-		attemptBody, err := newBody()
-		if err != nil {
-			if attemptBody != nil {
-				_ = attemptBody.Close()
-			}
-			return nil, err
-		}
-		outReq.Body = attemptBody
-		t.config.InjectAuthKey(&outReq.Header, key.Value())
-
-		attempts++
-		resp, rtErr := t.inner.RoundTrip(outReq)
+		resp, rtErr := t.inner.RoundTrip(req)
 		if rtErr != nil {
 			// Transport-level error, not a key issue.
 			return resp, rtErr
@@ -112,26 +112,22 @@ func (t *keyFailoverTransport) RoundTrip(req *http.Request) (*http.Response, err
 	}
 }
 
-// bufferBody returns a factory for replaying the request body. It uses GetBody
-// when available; otherwise it buffers the body once. The original body is closed.
-func bufferBody(req *http.Request) (func() (io.ReadCloser, error), error) {
+// replayBody returns a function that yields a fresh copy of req's body for each
+// attempt, or nil when req has no body. It reuses req.GetBody when set and
+// otherwise reads the body into a buffer once. The original body is closed.
+func replayBody(req *http.Request) (func() (io.ReadCloser, error), error) {
 	if req.Body != nil {
 		defer req.Body.Close()
 	}
-	if req.GetBody != nil {
+	if req.GetBody != nil || req.Body == nil {
 		return req.GetBody, nil
 	}
-	if req.Body == nil {
-		return func() (io.ReadCloser, error) {
-			return nil, nil //nolint:nilnil // A nil request body represents no body.
-		}, nil
-	}
 
-	body, err := io.ReadAll(req.Body)
+	payload, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
 	return func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(body)), nil
+		return io.NopCloser(bytes.NewReader(payload)), nil
 	}, nil
 }

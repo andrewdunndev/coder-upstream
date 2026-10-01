@@ -50,7 +50,7 @@ func (g *InflightGate) Middleware(next http.Handler) http.Handler {
 }
 
 // Admit returns nil, false after shutdown begins. Otherwise, release must be
-// called exactly once when the handler returns.
+// called exactly once when all admitted work has finished.
 func (g *InflightGate) Admit() (release func(), ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -76,8 +76,8 @@ func (g *InflightGate) release() {
 }
 
 // RequestContext derives a context canceled by either the parent or forced
-// shutdown. The caller must invoke cleanup when the handler returns to
-// unregister the shutdown callback and cancel the derived context.
+// shutdown. The caller must invoke cleanup when work using the context finishes
+// to unregister the shutdown callback and cancel the derived context.
 func (g *InflightGate) RequestContext(parent context.Context) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(g.ctx, cancel)

@@ -45,9 +45,14 @@ type ProviderCircuitBreakers struct {
 	metrics  *metrics.Metrics
 }
 
-// NewProviderCircuitBreakersWithObservability creates provider circuit
-// breakers with the shared state-change logging and metrics callback.
-func NewProviderCircuitBreakersWithObservability(provider string, cfg *config.CircuitBreaker, logger slog.Logger, m *metrics.Metrics) *ProviderCircuitBreakers {
+// NewProviderCircuitBreakers creates circuit breakers for a single provider
+// with state-change logging and metrics. Returns nil if cfg is nil (no
+// circuit breaker protection). m records state, trip, and reject metrics
+// and can be nil.
+func NewProviderCircuitBreakers(provider string, cfg *config.CircuitBreaker, logger slog.Logger, m *metrics.Metrics) *ProviderCircuitBreakers {
+	if cfg == nil {
+		return nil
+	}
 	onChange := func(endpoint, model string, from, to gobreaker.State) {
 		logger.Info(context.Background(), "circuit breaker state change",
 			slog.F("provider", provider),
@@ -62,17 +67,6 @@ func NewProviderCircuitBreakersWithObservability(provider string, cfg *config.Ci
 				m.CircuitBreakerTrips.WithLabelValues(provider, endpoint, model).Inc()
 			}
 		}
-	}
-	return NewProviderCircuitBreakers(provider, cfg, onChange, m)
-}
-
-// NewProviderCircuitBreakers creates circuit breakers for a single provider.
-// Returns nil if cfg is nil (no circuit breaker protection).
-// onChange is called when circuit state changes.
-// metrics is used to record circuit breaker reject counts (can be nil).
-func NewProviderCircuitBreakers(provider string, cfg *config.CircuitBreaker, onChange func(endpoint, model string, from, to gobreaker.State), m *metrics.Metrics) *ProviderCircuitBreakers {
-	if cfg == nil {
-		return nil
 	}
 	return &ProviderCircuitBreakers{
 		provider: provider,

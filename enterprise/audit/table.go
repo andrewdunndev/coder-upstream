@@ -40,6 +40,7 @@ var AuditActionMap = map[string][]codersdk.AuditAction{
 	"UserSkill":                     {codersdk.AuditActionCreate, codersdk.AuditActionWrite, codersdk.AuditActionDelete},
 	"ChatInstructionSettings":       {codersdk.AuditActionWrite},
 	"ChatOperationalSettings":       {codersdk.AuditActionWrite},
+	"ExperimentRule":                {codersdk.AuditActionWrite},
 }
 
 type Action string
@@ -529,6 +530,8 @@ var auditableResourcesTypes = map[any]map[string]Action{
 		"api_key_value_key_id":        ActionIgnore, // dbcrypt bookkeeping.
 		"custom_headers":              ActionSecret, // May contain credentials
 		"custom_headers_key_id":       ActionIgnore, // dbcrypt bookkeeping.
+		"signing_secret":              ActionSecret,
+		"signing_secret_key_id":       ActionIgnore, // dbcrypt bookkeeping.
 		"tool_allow_list":             ActionTrack,
 		"tool_deny_list":              ActionTrack,
 		"availability":                ActionTrack,
@@ -563,6 +566,13 @@ var auditableResourcesTypes = map[any]map[string]Action{
 		"computer_use_provider":            ActionTrack,
 		"debug_logging_allow_users":        ActionTrack,
 		"personal_model_overrides_enabled": ActionTrack,
+	},
+	&database.ExperimentRule{}: {
+		"id":         ActionIgnore, // Derived from the experiment name.
+		"experiment": ActionTrack,
+		"mode":       ActionTrack,
+		"condition":  ActionTrack,
+		"revision":   ActionTrack,
 	},
 	&database.UserSecret{}: {
 		"id":          ActionTrack,

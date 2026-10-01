@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/coder/coder/v2/aibridge/credential"
 )
 
 // Recorder describes all the possible usage information we need to capture during interactions with AI providers.
@@ -28,17 +30,7 @@ type ToolArgs any
 
 type Metadata map[string]any
 
-const (
-	MetadataKeyServiceTier = "service_tier"
-
-	// CredentialKindCentralized identifies provider-managed credentials.
-	CredentialKindCentralized = "centralized"
-	// CredentialKindBYOK identifies user-supplied provider credentials.
-	CredentialKindBYOK = "byok"
-	// CredentialHintFailoverKey is used before a centralized key is selected.
-	// Persisted hints use VARCHAR(15), so this value must remain at most 15 bytes.
-	CredentialHintFailoverKey = "<failover key>" //nolint:gosec // Placeholder, not a credential.
-)
+const MetadataKeyServiceTier = "service_tier"
 
 type InterceptionRecord struct {
 	ID                    string
@@ -61,7 +53,7 @@ type InterceptionRecord struct {
 	// did not pass through Agent Firewall.
 	AgentFirewallSequenceNumber *int32
 	// CredentialKind is always set: either BYOK or centralized.
-	CredentialKind string
+	CredentialKind credential.Kind
 	// CredentialHint is only set for BYOK, where the key is known
 	// from the request. Centralized uses key failover, so the hint
 	// can only be determined at end-of-interception.
@@ -127,8 +119,12 @@ type InterceptionRecordEnded struct {
 }
 
 type TokenUsageRecord struct {
-	InterceptionID        string
-	MsgID                 string
+	InterceptionID string
+	MsgID          string
+	// ProviderModel is the model reported by the upstream response, which
+	// may differ from the requested model when the provider resolves an
+	// alias. Empty when the response does not report one.
+	ProviderModel         string
 	Input                 int64
 	Output                int64
 	CacheReadInputTokens  int64

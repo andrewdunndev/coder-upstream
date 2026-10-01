@@ -732,6 +732,7 @@ func (q *sqlQuerier) GetAuthorizedConnectionLogsOffset(ctx context.Context, arg 
 			&i.ConnectionLog.ConnectionID,
 			&i.ConnectionLog.DisconnectTime,
 			&i.ConnectionLog.DisconnectReason,
+			&i.ConnectionLog.ClientSessionID,
 			&i.UserUsername,
 			&i.UserName,
 			&i.UserEmail,
@@ -849,6 +850,7 @@ func (q *sqlQuerier) GetAuthorizedChats(ctx context.Context, arg GetChatsParams,
 		arg.DiffURL,
 		arg.TitleQuery,
 		arg.HasUnread,
+		pq.Array(arg.ChatStatuses),
 		pq.Array(arg.PullRequestStatuses),
 		arg.PrNumber,
 		arg.RepoQuery,
@@ -1323,6 +1325,8 @@ func (q *sqlQuerier) GetAuthorizedMCPServerConfigs(ctx context.Context, organiza
 			&i.OrganizationID,
 			&i.GroupACL,
 			&i.UserACL,
+			&i.SigningSecret,
+			&i.SigningSecretKeyID,
 		); err != nil {
 			return nil, err
 		}

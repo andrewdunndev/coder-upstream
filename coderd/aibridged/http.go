@@ -1,7 +1,6 @@
 package aibridged
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,17 +16,6 @@ import (
 )
 
 var _ http.Handler = &Server{}
-
-type authenticatedAPIKeyIDContextKey struct{}
-
-func withAuthenticatedAPIKeyID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, authenticatedAPIKeyIDContextKey{}, id)
-}
-
-func authenticatedAPIKeyIDFromContext(ctx context.Context) (string, bool) {
-	id, ok := ctx.Value(authenticatedAPIKeyIDContextKey{}).(string)
-	return id, ok && id != ""
-}
 
 var (
 	ErrNoAuthKey             = xerrors.New("no authentication key provided")
@@ -173,7 +161,6 @@ func (s *Server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ctx = agplaibridge.WithAttribution(ctx, attribution)
-	ctx = withAuthenticatedAPIKeyID(ctx, resp.GetApiKeyId())
 
 	budgetResp, err := client.IsBudgetExceeded(ctx, &proto.IsBudgetExceededRequest{
 		UserId: id.String(),
@@ -194,9 +181,10 @@ func (s *Server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// Rewire request context to include actor.
 	//
 	// [NOTE]
-	// The metadata provided here must NOT be sensitive as it could be included
-	// in requests to upstream services.
-	r = r.WithContext(aibridge.AsActor(ctx, resp.GetOwnerId(), recorder.Metadata{
+	// The metadata provided here must NOT be sensitive as it is recorded and
+	// could be included in requests to upstream services. Email is passed
+	// separately so it is only forwarded when configured.
+	r = r.WithContext(aibridge.AsActor(ctx, resp.GetOwnerId(), resp.GetEmail(), recorder.Metadata{
 		"Username": resp.GetUsername(),
 	}))
 

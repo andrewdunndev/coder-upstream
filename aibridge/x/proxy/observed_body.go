@@ -1,18 +1,32 @@
 package proxy
 
-import "io"
+import (
+	"context"
+	"io"
+)
+
+type observationContextKey struct{}
+
+type responseObservation struct {
+	status         int
+	credentialHint string
+	err            error
+	body           *observedBody
+}
+
+func observationFromContext(ctx context.Context) *responseObservation {
+	//nolint:forcetypeassert // The caller installs it before invoking the shared proxy.
+	return ctx.Value(observationContextKey{}).(*responseObservation)
+}
 
 type observedBody struct {
 	io.ReadCloser
-	// onRead receives a borrowed slice backed by the caller's Read buffer. The
-	// callback must copy bytes it retains and must not block or perform I/O.
+	// onRead receives borrowed bytes and must copy anything it retains. It must
+	// not mutate the bytes, block, or perform I/O.
 	onRead  func([]byte)
 	eof     bool
+	closed  bool
 	readErr error
-}
-
-func newObservedBody(body io.ReadCloser, onRead func([]byte)) *observedBody {
-	return &observedBody{ReadCloser: body, onRead: onRead}
 }
 
 func (b *observedBody) Read(p []byte) (int, error) {
@@ -22,8 +36,13 @@ func (b *observedBody) Read(p []byte) (int, error) {
 	}
 	if err == io.EOF {
 		b.eof = true
-	} else if err != nil && b.readErr == nil {
+	} else if b.readErr == nil {
 		b.readErr = err
 	}
 	return n, err
+}
+
+func (b *observedBody) Close() error {
+	b.closed = true
+	return b.ReadCloser.Close()
 }

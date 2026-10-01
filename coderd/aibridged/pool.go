@@ -22,6 +22,8 @@ import (
 	"github.com/coder/coder/v2/aibridge/provider"
 	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/tracing"
+	"github.com/coder/coder/v2/coderd/aibridged/proto"
+	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/quartz"
 )
 
@@ -53,9 +55,58 @@ type PoolOptions struct {
 	MaxItems int64
 	TTL      time.Duration
 	Clock    quartz.Clock
+
+	// StructuredLogging makes each bridge emit AI Gateway interception
+	// records in the format described by [recorder.InterceptionLogMarker].
+	StructuredLogging bool
+	// DisableContentRecording stops prompts, tool call arguments and model
+	// thoughts from being recorded. Interceptions and token usage are still
+	// recorded, so AI spend accounting and budget enforcement are unaffected.
+	DisableContentRecording bool
 }
 
 var DefaultPoolOptions = PoolOptions{MaxItems: 5000, TTL: time.Minute * 15}
+
+// PoolOptionsFromConfig returns DefaultPoolOptions with the record policy the
+// deployment configured. Every construction site uses it, so the in-process
+// daemon, the standalone gateway and the test harness cannot drift.
+//
+// It also reports a deployment that drops content records without exporting
+// them anywhere: they never reach coderd, so if coderd is the only emitter the
+// deployment has silently stopped exporting the very records it is declining to
+// store. Nothing else reports this.
+func PoolOptionsFromConfig(ctx context.Context, logger slog.Logger, cfg codersdk.AIBridgeConfig) PoolOptions {
+	options := DefaultPoolOptions
+	options.StructuredLogging = cfg.EmitsStructuredLogs(codersdk.AIStructuredLoggingSourceGateway)
+	options.DisableContentRecording = cfg.DisableContentRecording.Value()
+
+	if options.DisableContentRecording && !options.StructuredLogging {
+		logger.Warn(ctx, "content recording is disabled but structured logs are emitted by coderd, so prompts, tool calls and model thoughts will not be exported; set --ai-gateway-structured-logging-source to gateway or both to keep exporting them")
+	}
+
+	return options
+}
+
+// newRecorder applies the same record policy in interception and proxy modes.
+func newRecorder(logger slog.Logger, tracer trace.Tracer, apiKeyID string, options PoolOptions, clientFn ClientFunc) recorder.Recorder {
+	var middleware []recorder.Middleware
+	if options.DisableContentRecording {
+		middleware = append(middleware, recorder.WithoutRecords(recorder.DisabledRecords{
+			PromptUsage:  true,
+			ToolUsage:    true,
+			ModelThought: true,
+		}))
+	}
+	return aibridge.NewRecorder(
+		logger.Named("recorder"), tracer, apiKeyID, options.StructuredLogging,
+		recorder.NewDRPCRecorder(apiKeyID, func(ctx context.Context) (proto.DRPCRecorderClient, error) {
+			// Acquire the client against each record's context, not the context
+			// used to construct the handler, which the recorder can outlive.
+			return clientFn(ctx)
+		}),
+		middleware...,
+	)
+}
 
 var _ Pooler = &CachedBridgePool{}
 
@@ -81,6 +132,11 @@ type CachedBridgePool struct {
 	// (*ristretto.Cache).Close may race against cache usage.
 	cacheMu sync.RWMutex
 	cacheWG sync.WaitGroup
+}
+
+// Options reports the options the pool was built with.
+func (p *CachedBridgePool) Options() PoolOptions {
+	return p.options
 }
 
 func NewCachedBridgePool(options PoolOptions, providers []aibridge.Provider, logger slog.Logger, metrics *aibridge.Metrics, tracer trace.Tracer) (*CachedBridgePool, error) {
@@ -224,20 +280,7 @@ func (p *CachedBridgePool) Acquire(ctx context.Context, req Request, clientFn Cl
 
 	span.AddEvent("cache_miss")
 	providerVersion := p.providerVersion.Load()
-	rec := aibridge.NewRecorder(
-		p.logger.Named("recorder"),
-		p.tracer,
-		func(clientCtx context.Context) (aibridge.Recorder, error) {
-			// The recorder outlives this Acquire call, so the client is acquired
-			// against the context of the record call being served.
-			client, err := clientFn(clientCtx)
-			if err != nil {
-				return nil, xerrors.Errorf("acquire client: %w", err)
-			}
-
-			return recorder.NewDRPCRecorder(req.APIKeyID, client), nil
-		},
-	)
+	rec := newRecorder(p.logger, p.tracer, req.APIKeyID, p.options, clientFn)
 
 	// Slow path.
 	// Creating an *aibridge.RequestBridge may take some time, so gate all subsequent callers behind the initial request and return the resulting value.
