@@ -47,9 +47,9 @@ type route struct {
 //
 // Each configured-but-disabled provider serves a 503 sentinel on every path
 // under its name. Enabled providers use the existing passthrough handler for
-// passthrough routes; bridged routes validate requests but still return 404.
-// Bedrock bridged routes are not supported in proxy mode and return 404
-// without validation.
+// passthrough routes. Bridged routes of non-Bedrock providers validate requests
+// but still return 404. Bedrock is excluded from proxy mode: its bridged routes
+// skip validation and return 404 regardless of credentials.
 // All snapshots share the server's inflight gate so shutdown drains their requests.
 func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Metrics, tracer trace.Tracer, inflight *aibridge.InflightGate) (*Router, error) {
 	if err := provider.ValidateProviders(providers); err != nil {
