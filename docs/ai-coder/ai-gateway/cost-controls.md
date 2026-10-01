@@ -19,8 +19,8 @@ AI Governance Cost Control requires:
 - AI Gateway [enabled and configured](./setup.md) with at least one provider.
 
 > [!WARNING]
-> The unsafe `ai-gateway-reverse-proxy` experiment records only the start and end of each request.
-> It doesn't record token usage, model, prompt, tool, or model reasoning data, and it doesn't accrue spend for the traffic it routes.
+> For bridged requests, which interception mode would intercept, the unsafe `ai-gateway-reverse-proxy` experiment records only when each request starts and ends.
+> It doesn't record token usage, model, prompt, tool, or model reasoning data for those requests, and it doesn't accrue spend for them.
 > Coder doesn't backfill usage or spend for that traffic later.
 > Budget checks still include spend recorded from other traffic, but they can't account for traffic routed through this experiment.
 > Leave the experiment off, or remove it and restart the embedded Coder server or standalone AI Gateway process, if you require spend enforcement.
