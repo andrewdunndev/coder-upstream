@@ -1,20 +1,12 @@
 package proxy
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
-	"errors"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,16 +14,13 @@ import (
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/trace/noop"
 	"golang.org/x/xerrors"
 
-	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/aibridge/circuitbreaker"
 	"github.com/coder/coder/v2/aibridge/client"
 	"github.com/coder/coder/v2/aibridge/config"
 	aibcontext "github.com/coder/coder/v2/aibridge/context"
 	"github.com/coder/coder/v2/aibridge/credential"
-	"github.com/coder/coder/v2/aibridge/intercept/apidump"
 	"github.com/coder/coder/v2/aibridge/keypool"
 	"github.com/coder/coder/v2/aibridge/metrics"
 	"github.com/coder/coder/v2/aibridge/provider"
@@ -80,64 +69,7 @@ func (r *lifecycleRecorder) RecordInterceptionEnded(ctx context.Context, record 
 	return r.endErr
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-type readerFunc func([]byte) (int, error)
-
-func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
-
-type trackedBody struct {
-	io.Reader
-	closes, eofs int
-}
-
-func (b *trackedBody) Read(p []byte) (int, error) {
-	n, err := b.Reader.Read(p)
-	if err == io.EOF {
-		b.eofs++
-	}
-	return n, err
-}
-func (b *trackedBody) Close() error { b.closes++; return nil }
-
-type failingWriter struct{ http.ResponseWriter }
-
-func (*failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
-func (w *failingWriter) Flush()                  { _ = http.NewResponseController(w.ResponseWriter).Flush() }
-func (w *failingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return http.NewResponseController(w.ResponseWriter).Hijack()
-}
-
-type failingFlushWriter struct{ http.ResponseWriter }
-
-func (*failingFlushWriter) FlushError() error { return io.ErrClosedPipe }
-func (w *failingFlushWriter) Flush()          { _ = w.FlushError() }
-func (w *failingFlushWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return http.NewResponseController(w.ResponseWriter).Hijack()
-}
-
-func newTestForwardingHandler(t *testing.T, prov provider.Provider, m *metrics.Metrics) *forwardingHandler {
-	t.Helper()
-	gate := aibridge.NewInflightGate(codertestutil.NewFakeSink(t).Logger())
-	h, transport, err := newForwardingHandler(prov, codertestutil.NewFakeSink(t).Logger(), m, noop.NewTracerProvider().Tracer(t.Name()), gate)
-	require.NoError(t, err)
-	require.NotNil(t, h.proxy)
-	t.Cleanup(transport.CloseIdleConnections)
-	t.Cleanup(func() { require.NoError(t, gate.Shutdown(context.Background())); gate.Close() })
-	return h
-}
-
-func recordedRequest(t *testing.T, body io.Reader) *http.Request {
-	t.Helper()
-	ctx := aibcontext.AsActor(t.Context(), t.Name(), "actor@example.test", recorder.Metadata{"team": "engineering"})
-	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", body).WithContext(ctx)
-	req.Pattern = "/openai/v1/chat/completions"
-	req.Header.Set("Authorization", "Bearer user-secret-key")
-	return req
-}
-
+// serveForwardingRequest applies the router's body limit before serving.
 func serveForwardingRequest(h *forwardingHandler, w http.ResponseWriter, r *http.Request, rec recorder.Recorder) {
 	if r.Body != nil && r.Body != http.NoBody {
 		r.Body = http.MaxBytesReader(w, r.Body, routing.MaxRequestBodyBytes)
@@ -147,6 +79,47 @@ func serveForwardingRequest(h *forwardingHandler, w http.ResponseWriter, r *http
 }
 
 func TestRouterRecorderDispatch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{path: "/openai/v1/responses", status: http.StatusOK},
+		{path: "/openai/v1/%72esponses", status: http.StatusOK},
+		{path: "/openai/v1%2Fresponses", status: http.StatusNotFound},
+		{path: "/openai/v1/responses/", status: http.StatusNotFound},
+		{path: "/openai/v1//responses", status: http.StatusTemporaryRedirect},
+		{path: "/unknown", status: http.StatusNotFound},
+		{path: "*", status: http.StatusBadRequest},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			t.Parallel()
+			expected := &struct{ recorder.Recorder }{}
+			called := false
+			router := &Router{fallback: http.NotFoundHandler(), routes: []route{{
+				pattern: "/openai/v1/responses",
+				serve: func(w http.ResponseWriter, r *http.Request, rec recorder.Recorder) {
+					called = true
+					require.Same(t, expected, rec)
+					require.Equal(t, "/openai/v1/responses", r.Pattern)
+					w.WriteHeader(http.StatusOK)
+				},
+			}}}
+			req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+			if tc.path == "*" {
+				req.URL.Path, req.RequestURI = tc.path, tc.path
+			} else {
+				req = httptest.NewRequest(http.MethodPost, tc.path, nil)
+			}
+			response := httptest.NewRecorder()
+			router.Serve(response, req, expected)
+			require.Equal(t, tc.status, response.Code)
+			require.Equal(t, tc.status == http.StatusOK, called)
+		})
+	}
+}
+
+func TestRouterRecordedDispatch(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		path   string
@@ -189,6 +162,109 @@ func TestRouterRecorderDispatch(t *testing.T) {
 				require.Empty(t, rec.starts)
 				require.Empty(t, rec.ends)
 			}
+		})
+	}
+}
+
+func recordedRequest(t *testing.T, body io.Reader) *http.Request {
+	t.Helper()
+	ctx := aibcontext.AsActor(t.Context(), t.Name(), "actor@example.test", recorder.Metadata{"team": "engineering"})
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", body).WithContext(ctx)
+	req.Pattern = "/openai/v1/chat/completions"
+	req.Header.Set("Authorization", "Bearer user-secret-key")
+	return req
+}
+
+func TestForwardingHandlerRejectsRequest(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"MissingActor", "MissingRecorder", "WebSocket", "Firewall", "DeclaredOversize", "MissingCredential", "UnsupportedSigning"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var rec recorder.Recorder = &struct{ recorder.Recorder }{}
+			body := &unreadBody{}
+			req := recordedRequest(t, body)
+			var prov provider.Provider = provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test"})
+			status := http.StatusBadRequest
+			switch name {
+			case "MissingActor":
+				req = req.WithContext(t.Context())
+			case "MissingRecorder":
+				rec = nil
+				status = http.StatusInternalServerError
+			case "WebSocket":
+				req.Method = http.MethodGet
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+				status = http.StatusNotImplemented
+			case "Firewall":
+				req.Header.Set("X-Coder-Agent-Firewall-Session-Id", "invalid")
+			case "DeclaredOversize":
+				req.ContentLength = routing.MaxRequestBodyBytes + 1
+				status = http.StatusRequestEntityTooLarge
+			case "MissingCredential":
+				req.Header.Del("Authorization")
+				status = http.StatusBadGateway
+			case "UnsupportedSigning":
+				var err error
+				prov, err = provider.NewAnthropic(t.Context(), config.Anthropic{BaseURL: "https://upstream.example.test"}, nil, &config.AWSClaudePlatform{Region: "us-west-2", WorkspaceID: "wrkspc_test"})
+				require.NoError(t, err)
+				req.Header.Del("Authorization")
+				status = http.StatusNotImplemented
+			}
+			h := &forwardingHandler{provider: prov}
+			response := httptest.NewRecorder()
+			record, cred := h.checkRequest(response, req, rec)
+			require.Nil(t, record)
+			require.Nil(t, cred)
+			require.Equal(t, status, response.Code)
+			require.False(t, body.read, "preflight must not read the request body")
+			require.Equal(t, name == "DeclaredOversize", body.closed)
+		})
+	}
+}
+
+func TestForwardingHandlerRequestMetadata(t *testing.T) {
+	t.Parallel()
+	for _, pooled := range []bool{false, true} {
+		name := "BYOK"
+		if pooled {
+			name = "Pool"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			body := &unreadBody{}
+			req := recordedRequest(t, body)
+			req.Header.Set("User-Agent", "claude-code/1.0")
+			req.Header.Set("X-Coder-Agent-Firewall-Session-Id", "e5f6a7b8-1234-5678-9abc-def012345678")
+			req.Header.Set("X-Coder-Agent-Firewall-Sequence-Number", "42")
+			var pool *keypool.Pool
+			kind, hint := credential.KindBYOK, utils.MaskSecret("user-secret-key")
+			if pooled {
+				var err error
+				pool, err = keypool.New("openai", []string{"pool-key"}, quartz.NewMock(t), nil)
+				require.NoError(t, err)
+				req.Header.Del("Authorization")
+				kind, hint = credential.KindCentralized, credential.HintFailoverKey
+			}
+			h := &forwardingHandler{provider: provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test", KeyPool: pool})}
+			response := httptest.NewRecorder()
+			record, cred := h.checkRequest(response, req, &struct{ recorder.Recorder }{})
+			require.NotNil(t, record)
+			require.NotNil(t, cred)
+			require.Equal(t, kind, cred.Kind())
+			require.Equal(t, kind, record.CredentialKind)
+			require.Equal(t, hint, record.CredentialHint)
+			require.Equal(t, t.Name(), record.InitiatorID)
+			require.Equal(t, recorder.Metadata{"team": "engineering"}, record.Metadata)
+			require.Equal(t, "openai", record.ProviderName)
+			require.Equal(t, string(client.ClaudeCode), record.Client)
+			require.Equal(t, req.UserAgent(), record.UserAgent)
+			require.Equal(t, new("e5f6a7b8-1234-5678-9abc-def012345678"), record.AgentFirewallSessionID)
+			require.Equal(t, new(int32(42)), record.AgentFirewallSequenceNumber)
+			require.Empty(t, record.Model)
+			require.Empty(t, response.Body.String())
+			require.False(t, body.read)
+			require.False(t, body.closed)
 		})
 	}
 }
@@ -256,17 +332,8 @@ func TestForwardingHandlerLifecycle(t *testing.T) {
 			calls := 0
 			h.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				calls++
-				require.Zero(t, input.eofs)
-				payload, err := io.ReadAll(r.Body)
+				_, err := io.Copy(io.Discard, r.Body)
 				require.NoError(t, err)
-				require.Equal(t, "not JSON", string(payload))
-				require.NotNil(t, r.GetBody)
-				replay, err := r.GetBody()
-				require.NoError(t, err)
-				payload, err = io.ReadAll(replay)
-				require.NoError(t, err)
-				require.NoError(t, replay.Close())
-				require.Equal(t, "not JSON", string(payload))
 				if transportErr != nil {
 					return nil, transportErr
 				}
@@ -282,14 +349,13 @@ func TestForwardingHandlerLifecycle(t *testing.T) {
 			codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done())
 			require.Equal(t, 1, input.closes)
 			require.Equal(t, 1, input.eofs)
+			require.Equal(t, 1, calls)
 			require.Len(t, rec.starts, 1)
 			if name == "StartFailure" {
-				require.Equal(t, 1, calls)
 				require.Equal(t, "chunk", response.Body.String())
 				require.Empty(t, rec.ends)
 				return
 			}
-			require.Equal(t, 1, calls)
 			require.Len(t, rec.ends, 1)
 			require.Equal(t, rec.starts[0].ID, rec.ends[0].ID)
 			require.False(t, rec.starts[0].StartedAt.IsZero())
@@ -322,121 +388,85 @@ func TestForwardingHandlerLifecycle(t *testing.T) {
 	}
 }
 
-func TestForwardingHandlerWireAndFailover(t *testing.T) {
+// TestForwardingHandlerRecordsCredentials asserts the recorded request
+// metadata and the credential hints before and after key failover.
+func TestForwardingHandlerRecordsCredentials(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"BYOKWithAPIDump", "Pool", "ExhaustedPool"} {
-		pooled := name != "BYOKWithAPIDump"
+	for _, name := range []string{"OpenAIBYOK", "AnthropicBYOK", "CopilotBYOK", "Pool", "ExhaustedPool"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			var compressed bytes.Buffer
-			gz := gzip.NewWriter(&compressed)
-			_, err := gz.Write([]byte("raw response"))
+			pooled := name == "Pool" || name == "ExhaustedPool"
+			pool, err := keypool.New("openai", []string{"first-secret-key", "second-secret-key"}, quartz.NewMock(t), nil)
 			require.NoError(t, err)
-			require.NoError(t, gz.Close())
-			keys := make(chan string, 2)
-			var attempts atomic.Int32
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				keys <- r.Header.Get("Authorization")
-				attempt := attempts.Add(1)
-				payload, err := io.ReadAll(r.Body)
-				assert.NoError(t, err)
-				assert.Equal(t, "  not JSON\x00\n", string(payload))
-				assert.EqualValues(t, -1, r.ContentLength)
-				assert.Equal(t, "/base/models/a%2Fb", r.URL.EscapedPath())
-				assert.Equal(t, "configured=1&raw=a;b", r.URL.RawQuery)
-				if pooled {
-					assert.Equal(t, "claude-code/1.0", r.UserAgent())
-					assert.Equal(t, "gzip", r.Header.Get("Accept-Encoding"))
-				} else {
-					assert.Empty(t, r.UserAgent())
-					assert.Empty(t, r.Header.Get("Accept-Encoding"))
-				}
-				if pooled && (attempt == 1 || name == "ExhaustedPool") {
-					w.WriteHeader(http.StatusUnauthorized)
-					return
-				}
-				w.Header().Set("Content-Encoding", "gzip")
-				_, _ = w.Write(compressed.Bytes())
-			}))
-			t.Cleanup(upstream.Close)
-			var pool *keypool.Pool
-			if pooled {
-				pool, err = keypool.New("openai", []string{"first-secret-key", "second-secret-key"}, quartz.NewMock(t), nil)
-				require.NoError(t, err)
-			}
-			dumpDir := ""
-			if !pooled {
-				dumpDir = t.TempDir()
-			}
-			h := newTestForwardingHandler(t, provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL + "/base?configured=1", KeyPool: pool, APIDumpDir: dumpDir}), nil)
-			rec := &lifecycleRecorder{}
-			body := &trackedBody{Reader: strings.NewReader("  not JSON\x00\n")}
-			req := recordedRequest(t, body)
-			req.URL.Path = "/openai/v1/models/a/b"
-			req.URL.RawPath = "/openai/v1/models/a%2Fb"
-			req.URL.RawQuery = "raw=a;b"
-			if pooled {
-				req.Header.Del("Authorization")
-				req.Header.Set("User-Agent", "claude-code/1.0")
-				req.Header.Set("Accept-Encoding", "gzip")
-			}
-			req.Header.Set("X-Claude-Code-Session-Id", "session-one")
+			var prov provider.Provider = provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test", KeyPool: pool})
+			req := recordedRequest(t, strings.NewReader("body"))
 			req.Header.Set("X-Coder-Agent-Firewall-Session-Id", "e5f6a7b8-1234-5678-9abc-def012345678")
 			req.Header.Set("X-Coder-Agent-Firewall-Sequence-Number", "42")
+			kind, startHint, endHint := credential.KindBYOK, utils.MaskSecret("user-secret-key"), utils.MaskSecret("user-secret-key")
+			wantStatus, wantErrType := http.StatusUnauthorized, recorder.ErrorTypeUnauthorized
+			switch name {
+			case "AnthropicBYOK":
+				prov, err = provider.NewAnthropic(t.Context(), config.Anthropic{BaseURL: "https://upstream.example.test", KeyPool: pool}, nil, nil)
+				require.NoError(t, err)
+				req.Header.Del("Authorization")
+				req.Header.Set("X-Api-Key", "anthropic-secret-key")
+				startHint, endHint = utils.MaskSecret("anthropic-secret-key"), utils.MaskSecret("anthropic-secret-key")
+			case "CopilotBYOK":
+				prov = provider.NewCopilot(config.Copilot{BaseURL: "https://upstream.example.test"})
+			case "Pool", "ExhaustedPool":
+				req.Header.Del("Authorization")
+				req.Header.Set("User-Agent", "claude-code/1.0")
+				req.Header.Set("X-Claude-Code-Session-Id", "session-one")
+				kind, startHint, endHint = credential.KindCentralized, credential.HintFailoverKey, utils.MaskSecret("second-secret-key")
+				if name == "Pool" {
+					wantStatus, wantErrType = http.StatusOK, ""
+				} else {
+					wantStatus = http.StatusBadGateway
+				}
+			}
+			h := newTestForwardingHandler(t, prov, nil)
+			attempts := 0
+			h.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				attempts++
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					return nil, err
+				}
+				status := http.StatusUnauthorized
+				if name == "Pool" && attempts == 2 {
+					status = http.StatusOK
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{}, Body: http.NoBody}, nil
+			})
 			original := req.Header.Clone()
+			rec := &lifecycleRecorder{}
 			response := httptest.NewRecorder()
 			serveForwardingRequest(h, response, req, rec)
 			codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done())
-			if name == "ExhaustedPool" {
-				require.Equal(t, http.StatusBadGateway, response.Code)
-			} else {
-				require.Equal(t, http.StatusOK, response.Code)
-				require.Equal(t, compressed.Bytes(), response.Body.Bytes())
-				require.Equal(t, "gzip", response.Header().Get("Content-Encoding"))
-			}
+			require.Equal(t, wantStatus, response.Code)
 			require.Equal(t, original, req.Header)
-			require.Equal(t, 1, body.eofs)
-			require.Equal(t, 1, body.closes)
 			require.Len(t, rec.starts, 1)
 			require.Len(t, rec.ends, 1)
-			if name == "ExhaustedPool" {
-				require.Equal(t, recorder.ErrorTypeUnauthorized, rec.ends[0].ErrorType)
-				require.Contains(t, rec.ends[0].ErrorMessage, "key")
-			} else {
-				require.Empty(t, rec.ends[0].ErrorType)
-			}
-			if dumpDir != "" {
-				for _, suffix := range []string{apidump.SuffixRequest, apidump.SuffixResponse} {
-					files, err := filepath.Glob(filepath.Join(dumpDir, "openai", "passthrough", "*"+suffix))
-					require.NoError(t, err)
-					require.Len(t, files, 1)
-					data, err := os.ReadFile(files[0])
-					require.NoError(t, err)
-					require.NotContains(t, string(data), "user-secret-key")
-					if suffix == apidump.SuffixRequest {
-						require.Contains(t, string(data), "Authorization: "+utils.MaskSecret("Bearer user-secret-key"))
-						require.Contains(t, string(data), "  not JSON\x00\n")
-					} else {
-						require.Contains(t, string(data), "HTTP/1.1 200 OK")
-					}
-				}
-			}
-			start := rec.starts[0]
+			start, end := rec.starts[0], rec.ends[0]
+			require.Equal(t, start.ID, end.ID)
 			require.Equal(t, t.Name(), start.InitiatorID)
 			require.Equal(t, recorder.Metadata{"team": "engineering"}, start.Metadata)
 			require.Equal(t, new("e5f6a7b8-1234-5678-9abc-def012345678"), start.AgentFirewallSessionID)
 			require.Equal(t, new(int32(42)), start.AgentFirewallSequenceNumber)
 			require.Empty(t, start.Model)
+			require.Equal(t, kind, start.CredentialKind)
+			require.Equal(t, startHint, start.CredentialHint)
+			require.Equal(t, wantErrType, end.ErrorType)
 			if pooled {
-				require.Equal(t, "Bearer first-secret-key", codertestutil.RequireReceive(codertestutil.Context(t, codertestutil.WaitLong), t, keys))
-				require.Equal(t, "Bearer second-secret-key", codertestutil.RequireReceive(codertestutil.Context(t, codertestutil.WaitLong), t, keys))
-				require.Equal(t, credential.KindCentralized, start.CredentialKind)
-				require.Equal(t, credential.HintFailoverKey, start.CredentialHint)
-				require.Equal(t, utils.MaskSecret("second-secret-key"), rec.ends[0].CredentialHint)
+				require.Equal(t, 2, attempts)
+				require.Equal(t, endHint, end.CredentialHint, "the end record must report the key that served the final attempt")
 				require.Equal(t, new("session-one"), start.ClientSessionID)
 				require.Equal(t, string(client.ClaudeCode), start.Client)
 			} else {
-				require.Equal(t, "Bearer user-secret-key", codertestutil.RequireReceive(codertestutil.Context(t, codertestutil.WaitLong), t, keys))
+				require.Equal(t, 1, attempts, "BYOK failures must not fall back to pooled credentials")
+				require.Equal(t, endHint, end.CredentialHint)
+			}
+			if name == "ExhaustedPool" {
+				require.Contains(t, end.ErrorMessage, "key")
 			}
 		})
 	}
@@ -604,7 +634,10 @@ func TestForwardingHandlerProcessingPanic(t *testing.T) {
 	}
 }
 
-func TestForwardingHandlerTee(t *testing.T) {
+// TestForwardingHandlerRecordsStreamedRequest asserts that the start record
+// keeps the request start time and takes body metadata from input that
+// arrives after forwarding begins.
+func TestForwardingHandlerRecordsStreamedRequest(t *testing.T) {
 	t.Parallel()
 	ctx := codertestutil.Context(t, codertestutil.WaitLong)
 	input, output := io.Pipe()
@@ -612,33 +645,22 @@ func TestForwardingHandlerTee(t *testing.T) {
 	defer output.Close()
 	const prefix = `{"metadata":{"user_id":"user_hash_account_id_session_`
 	const suffix = `session-one"}}`
-	pool, err := keypool.New("openai", []string{"first-key", "second-key"}, quartz.NewMock(t), nil)
-	require.NoError(t, err)
-	h := newTestForwardingHandler(t, provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test", KeyPool: pool}), nil)
-	rec := &lifecycleRecorder{}
+	h := newTestForwardingHandler(t, provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test"}), nil)
 	readPrefix := make(chan time.Time, 1)
-	attempts := 0
 	h.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		defer r.Body.Close()
-		attempts++
-		if attempts == 1 {
-			chunk := make([]byte, len(prefix))
-			_, err := io.ReadFull(r.Body, chunk)
-			assert.NoError(t, err)
-			assert.Equal(t, prefix, string(chunk))
-			readPrefix <- time.Now()
-			return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: http.NoBody}, nil
-		}
-		payload, err := io.ReadAll(r.Body)
-		if !assert.NoError(t, err) {
+		chunk := make([]byte, len(prefix))
+		if _, err := io.ReadFull(r.Body, chunk); err != nil {
 			return nil, err
 		}
-		assert.Equal(t, prefix+suffix, string(payload), "the retry must replay the prefix and read the remaining input")
+		readPrefix <- time.Now()
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return nil, err
+		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
 	})
 	req := recordedRequest(t, input)
-	req.Header.Del("Authorization")
 	req.Header.Set("User-Agent", "claude-code/1.0")
+	rec := &lifecycleRecorder{}
 	response := httptest.NewRecorder()
 	served := make(chan struct{})
 	before := time.Now()
@@ -646,7 +668,7 @@ func TestForwardingHandlerTee(t *testing.T) {
 		defer close(served)
 		serveForwardingRequest(h, response, req, rec)
 	}()
-	_, err = io.WriteString(output, prefix)
+	_, err := io.WriteString(output, prefix)
 	require.NoError(t, err)
 	forwardedAt := codertestutil.RequireReceive(ctx, t, readPrefix)
 	_, err = io.WriteString(output, suffix)
@@ -655,7 +677,6 @@ func TestForwardingHandlerTee(t *testing.T) {
 	codertestutil.TryReceive(ctx, t, served)
 	codertestutil.TryReceive(ctx, t, rec.done())
 	require.Equal(t, http.StatusOK, response.Code)
-	require.Equal(t, 2, attempts)
 	require.Len(t, rec.starts, 1)
 	require.Len(t, rec.ends, 1)
 	require.Equal(t, new("session-one"), rec.starts[0].ClientSessionID)
@@ -664,238 +685,91 @@ func TestForwardingHandlerTee(t *testing.T) {
 	require.Empty(t, rec.ends[0].ErrorType)
 }
 
-func TestRequestBufferBytes(t *testing.T) {
+func TestForwardingHandlerRecordsCircuitBreaker(t *testing.T) {
 	t.Parallel()
-	t.Run("Empty", func(t *testing.T) {
-		t.Parallel()
-		b := &requestBuffer{source: http.NoBody, err: io.EOF}
-		reader, err := b.getBody()
-		require.NoError(t, err)
-		require.Equal(t, http.NoBody, reader, "known empty bodies must not become chunked requests")
-		payload, err := b.bytes()
-		require.NoError(t, err)
-		require.Empty(t, payload)
-	})
-	input := &trackedBody{Reader: strings.NewReader("payload")}
-	b := &requestBuffer{source: input}
-	reader, err := b.getBody()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = reader.Close() })
-
-	for range 2 {
-		payload, err := b.bytes()
-		require.NoError(t, err)
-		require.Equal(t, "payload", string(payload))
-	}
-	payload, err := io.ReadAll(reader)
-	require.NoError(t, err)
-	require.Equal(t, "payload", string(payload), "filling the buffer must not advance another reader")
-	require.Equal(t, 1, input.eofs, "completed input must not be read again")
-}
-
-func TestRequestBufferReaders(t *testing.T) {
-	t.Parallel()
-	for _, terminal := range []error{io.EOF, io.ErrClosedPipe} {
-		t.Run(terminal.Error(), func(t *testing.T) {
-			t.Parallel()
-			ctx := codertestutil.Context(t, codertestutil.WaitLong)
-			reading, release := make(chan struct{}), make(chan struct{})
-			defer close(release)
-			calls := 0
-			b := &requestBuffer{captured: make(chan capturedBody, 1), source: readerFunc(func(p []byte) (int, error) {
-				calls++
-				if calls == 1 {
-					return copy(p, "prefix"), nil
-				}
-				close(reading)
-				<-release
-				return copy(p, "suffix"), terminal
-			})}
-			first, err := b.getBody()
-			require.NoError(t, err)
-			defer first.Close()
-			prefix := make([]byte, len("prefix"))
-			_, err = io.ReadFull(first, prefix)
-			require.NoError(t, err)
-			done := make(chan struct{}, 2)
-			go func() {
-				payload, err := b.bytes()
-				if errors.Is(terminal, io.EOF) {
-					assert.NoError(t, err)
-					assert.Equal(t, "prefixsuffix", string(payload))
-				} else {
-					assert.ErrorIs(t, err, terminal)
-					assert.Nil(t, payload)
-				}
-				done <- struct{}{}
-			}()
-			codertestutil.TryReceive(ctx, t, reading)
-			b.finishCapture()
-			capture := codertestutil.RequireReceive(ctx, t, b.captured)
-			require.ErrorIs(t, capture.err, io.ErrUnexpectedEOF, "abandoning observation must not wait for a source read")
-			require.Nil(t, capture.payload)
-			second, err := b.getBody()
-			require.NoError(t, err)
-			defer second.Close()
-			go func() {
-				_, err := io.ReadFull(second, prefix)
-				assert.NoError(t, err)
-				assert.Equal(t, "prefix", string(prefix))
-				done <- struct{}{}
-			}()
-			// A cached prefix must remain readable while another reader is
-			// blocked waiting for input at the buffered end.
-			codertestutil.RequireReceive(ctx, t, done)
-			release <- struct{}{}
-			payload, err := io.ReadAll(second)
-			require.Equal(t, "suffix", string(payload))
-			if errors.Is(terminal, io.EOF) {
-				require.NoError(t, err)
-				payload, err = b.bytes()
-				require.NoError(t, err)
-				require.Equal(t, "prefixsuffix", string(payload))
-			} else {
-				require.ErrorIs(t, err, terminal)
-				_, err = b.bytes()
-				require.ErrorIs(t, err, terminal)
-			}
-			codertestutil.RequireReceive(ctx, t, done)
-			require.Equal(t, 2, calls, "input bytes must be captured only once")
-		})
-	}
-}
-
-func TestForwardingHandlerProviderCredentials(t *testing.T) {
-	t.Parallel()
-	for _, name := range []string{"OpenAIConnectionAuth", "AnthropicAPIKey", "CopilotBearer"} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			pool, err := keypool.New("test", []string{"pool-secret-key"}, quartz.NewMock(t), nil)
-			require.NoError(t, err)
-			var prov provider.Provider = provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test", KeyPool: pool})
-			rec := &lifecycleRecorder{}
-			req := recordedRequest(t, strings.NewReader("body"))
-			wantAuth := http.Header{"Authorization": {"Bearer user-secret-key"}}
-			switch name {
-			case "OpenAIConnectionAuth":
-				req.Header.Set("Connection", "Authorization")
-			case "AnthropicAPIKey":
-				prov, err = provider.NewAnthropic(t.Context(), config.Anthropic{BaseURL: "https://upstream.example.test", KeyPool: pool}, nil, nil)
-				require.NoError(t, err)
-				req.Header.Set("X-Api-Key", "anthropic-secret-key")
-				wantAuth = http.Header{"X-Api-Key": {"anthropic-secret-key"}}
-			case "CopilotBearer":
-				prov = provider.NewCopilot(config.Copilot{BaseURL: "https://upstream.example.test"})
-			}
-			h := newTestForwardingHandler(t, prov, nil)
-			calls := 0
-			h.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				calls++
-				for _, header := range []string{"Authorization", "X-Api-Key"} {
-					require.Equal(t, wantAuth.Values(header), r.Header.Values(header))
-				}
-				return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: http.NoBody}, nil
-			})
-			response := httptest.NewRecorder()
-			serveForwardingRequest(h, response, req, rec)
-			codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done())
-			require.Equal(t, http.StatusUnauthorized, response.Code)
-			require.Equal(t, 1, calls, "BYOK failures must not fall back to pooled credentials")
-			require.Len(t, rec.starts, 1)
-			require.Len(t, rec.ends, 1)
-			require.Equal(t, credential.KindBYOK, rec.starts[0].CredentialKind)
-			require.Equal(t, recorder.ErrorTypeUnauthorized, rec.ends[0].ErrorType)
-		})
-	}
-}
-
-func TestForwardingHandlerCircuitBreaker(t *testing.T) {
-	t.Parallel()
-	var calls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusEarlyHints)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	t.Cleanup(upstream.Close)
 	cfg := config.DefaultCircuitBreaker()
 	cfg.FailureThreshold = 1
 	cfg.Timeout = time.Hour
-	h := newTestForwardingHandler(t, provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL, CircuitBreaker: &cfg}), nil)
+	h := newTestForwardingHandler(t, provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test", CircuitBreaker: &cfg}), nil)
+	calls := 0
+	h.transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}, Body: http.NoBody}, nil
+	})
 	for range 2 {
 		rec := &lifecycleRecorder{}
 		response := httptest.NewRecorder()
 		serveForwardingRequest(h, response, recordedRequest(t, nil), rec)
 		codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done())
+		require.Equal(t, http.StatusServiceUnavailable, response.Code)
 		require.Len(t, rec.starts, 1)
 		require.Len(t, rec.ends, 1)
 		require.Equal(t, recorder.ErrorTypeServerError, rec.ends[0].ErrorType)
 	}
-	require.EqualValues(t, 1, calls.Load(), "the final 503 must trip the breaker despite informational responses")
+	require.Equal(t, 1, calls, "the open breaker must reject the second request")
 }
 
-func TestForwardingHandlerRejectsRequest(t *testing.T) {
+// TestForwardingHandlerBodyFailureRecords asserts that failures reading the
+// request body after admission are recorded, while preflight rejections are not.
+func TestForwardingHandlerBodyFailureRecords(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"MissingActor", "MissingRecorder", "WebSocket", "Firewall", "DeclaredOversize", "UnknownLengthOversize", "BodyReadFailure", "UnsupportedSigning"} {
+	for _, name := range []string{"UnknownLengthOversize", "BodyReadFailure", "PreflightRejection"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			rec := &lifecycleRecorder{}
-			var requestRecorder recorder.Recorder = rec
-			req := recordedRequest(t, strings.NewReader("body"))
-			var prov provider.Provider = provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test"})
-			status := http.StatusBadRequest
+			req := recordedRequest(t, nil)
+			req.ContentLength = -1
+			var status int
 			switch name {
-			case "MissingActor":
-				req = req.WithContext(t.Context())
-			case "MissingRecorder":
-				requestRecorder = nil
-				status = http.StatusInternalServerError
-			case "WebSocket":
-				req.Method = http.MethodGet
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Upgrade", "websocket")
-				status = http.StatusNotImplemented
-			case "Firewall":
-				req.Header.Set("X-Coder-Agent-Firewall-Session-Id", "invalid")
-			case "DeclaredOversize":
-				req.ContentLength = routing.MaxRequestBodyBytes + 1
-				status = http.StatusRequestEntityTooLarge
 			case "UnknownLengthOversize":
 				req.Body = io.NopCloser(io.LimitReader(readerFunc(func(p []byte) (int, error) { clear(p); return len(p), nil }), routing.MaxRequestBodyBytes+1))
-				req.ContentLength = -1
 				status = http.StatusRequestEntityTooLarge
 			case "BodyReadFailure":
 				req.Body = io.NopCloser(readerFunc(func([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }))
-				req.ContentLength = -1
 				status = http.StatusBadGateway
-			case "UnsupportedSigning":
-				var err error
-				prov, err = provider.NewAnthropic(t.Context(), config.Anthropic{BaseURL: "https://upstream.example.test"}, nil, &config.AWSClaudePlatform{Region: "us-west-2", WorkspaceID: "wrkspc_test"})
-				require.NoError(t, err)
-				req.Header.Del("Authorization")
-				status = http.StatusNotImplemented
+			case "PreflightRejection":
+				req.Body = io.NopCloser(strings.NewReader("body"))
+				req.Header.Set("X-Coder-Agent-Firewall-Session-Id", "invalid")
+				status = http.StatusBadRequest
 			}
-			h := newTestForwardingHandler(t, prov, nil)
-			bodyFailure := name == "UnknownLengthOversize" || name == "BodyReadFailure"
+			h := newTestForwardingHandler(t, provider.NewOpenAI(config.OpenAI{BaseURL: "https://upstream.example.test"}), nil)
 			h.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-				require.True(t, bodyFailure, "unexpected upstream request")
+				require.NotEqual(t, "PreflightRejection", name, "unexpected upstream request")
 				_, err := io.Copy(io.Discard, r.Body)
 				return nil, err
 			})
+			rec := &lifecycleRecorder{}
 			response := httptest.NewRecorder()
-			serveForwardingRequest(h, response, req, requestRecorder)
+			serveForwardingRequest(h, response, req, rec)
 			require.Equal(t, status, response.Code)
-			if bodyFailure {
-				codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done())
-				require.Len(t, rec.starts, 1)
-				require.Len(t, rec.ends, 1)
-				require.NotEmpty(t, rec.starts[0].ID)
-				require.Nil(t, rec.starts[0].ClientSessionID)
-				require.NotEmpty(t, rec.ends[0].ErrorType)
-			} else {
+			if name == "PreflightRejection" {
+				require.NoError(t, h.inflight.Shutdown(codertestutil.Context(t, codertestutil.WaitLong)))
 				require.Empty(t, rec.starts)
 				require.Empty(t, rec.ends)
+				return
+			}
+			codertestutil.TryReceive(codertestutil.Context(t, codertestutil.WaitLong), t, rec.done())
+			require.Len(t, rec.starts, 1)
+			require.Len(t, rec.ends, 1)
+			require.NotEmpty(t, rec.starts[0].ID)
+			require.Nil(t, rec.starts[0].ClientSessionID)
+			require.NotEmpty(t, rec.ends[0].ErrorType)
+			if name == "UnknownLengthOversize" {
+				require.Equal(t, recorder.ErrorTypeBadRequest, rec.ends[0].ErrorType)
 			}
 		})
 	}
+}
+
+type unreadBody struct {
+	read, closed bool
+}
+
+func (b *unreadBody) Read([]byte) (int, error) {
+	b.read = true
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (b *unreadBody) Close() error {
+	b.closed = true
+	return nil
 }

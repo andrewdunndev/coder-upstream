@@ -15,7 +15,7 @@ type responseObservation struct {
 }
 
 func observationFromContext(ctx context.Context) *responseObservation {
-	//nolint:forcetypeassert // ServeHTTP installs it before invoking the shared proxy.
+	//nolint:forcetypeassert // The caller installs it before invoking the shared proxy.
 	return ctx.Value(observationContextKey{}).(*responseObservation)
 }
 

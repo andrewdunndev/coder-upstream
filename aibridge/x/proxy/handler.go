@@ -164,33 +164,7 @@ func (h *forwardingHandler) serve(w http.ResponseWriter, r *http.Request, rec re
 			panic(panicValue)
 		}
 	}()
-	state.err = h.breaker.Execute(route, "", w, func(rw http.ResponseWriter) error {
-		writer := &errorCapturingWriter{ResponseWriter: rw, client: w}
-		defer func() {
-			if state.err == nil {
-				state.err = writer.Error()
-			}
-			if state.body != nil && !state.body.closed {
-				_ = state.body.Close()
-			}
-		}()
-		h.proxy.ServeHTTP(writer, forward)
-		if state.body == nil && state.err != nil {
-			if _, ok := errors.AsType[*http.MaxBytesError](state.err); ok {
-				routing.WriteRequestBodyTooLarge(ctx, writer)
-			} else {
-				h.logger.Warn(ctx, "upstream proxy error", slog.Error(state.err))
-				http.Error(writer, "upstream proxy error", http.StatusBadGateway)
-			}
-		}
-		if writer.Error() != nil || (state.body != nil && !state.body.eof) {
-			if state.err == nil {
-				state.err = writer.Error()
-			}
-			panic(http.ErrAbortHandler)
-		}
-		return state.err
-	})
+	h.forward(w, forward, body, state)
 }
 
 func (h *forwardingHandler) checkRequest(w http.ResponseWriter, r *http.Request, rec recorder.Recorder) (*recorder.InterceptionRecord, credential.Credential) {
@@ -268,6 +242,41 @@ func (*forwardingHandler) prepareForwarding(r *http.Request, cred credential.Cre
 	return r, body
 }
 
+// forward delivers the prepared request and observes its terminal response.
+// Capture completes even when delivery aborts, without waiting for more input.
+func (h *forwardingHandler) forward(w http.ResponseWriter, r *http.Request, body *requestBuffer, state *responseObservation) {
+	defer body.finishCapture()
+	ctx := r.Context()
+	route := strings.TrimPrefix(r.Pattern, "/"+h.provider.Name())
+	state.err = h.breaker.Execute(route, "", w, func(rw http.ResponseWriter) error {
+		writer := &errorCapturingWriter{ResponseWriter: rw, client: w}
+		defer func() {
+			if state.err == nil {
+				state.err = writer.Error()
+			}
+			if state.body != nil && !state.body.closed {
+				_ = state.body.Close()
+			}
+		}()
+		h.proxy.ServeHTTP(writer, r)
+		if state.body == nil && state.err != nil {
+			if _, ok := errors.AsType[*http.MaxBytesError](state.err); ok {
+				routing.WriteRequestBodyTooLarge(ctx, writer)
+			} else {
+				h.logger.Warn(ctx, "upstream proxy error", slog.Error(state.err))
+				http.Error(writer, "upstream proxy error", http.StatusBadGateway)
+			}
+		}
+		if writer.Error() != nil || (state.body != nil && !state.body.eof) {
+			if state.err == nil {
+				state.err = writer.Error()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		return state.err
+	})
+}
+
 func (h *forwardingHandler) processRequest(ctx context.Context, r *http.Request, rec recorder.Recorder, record recorder.InterceptionRecord, body *requestBuffer, started chan<- error) (outErr error) {
 	defer func() {
 		if recover() != nil {
@@ -324,7 +333,6 @@ func (*forwardingHandler) processResponse(ctx context.Context, rec recorder.Reco
 // finishForwarding publishes an immutable outcome without waiting for processing.
 func (h *forwardingHandler) finishForwarding(ctx context.Context, r *http.Request, start time.Time, record *recorder.InterceptionRecord, body *requestBuffer, state *responseObservation, finished chan<- recorder.InterceptionRecordEnded, panicValue any) {
 	end := time.Now()
-	body.finishCapture()
 	terminal := state.err
 	body.mu.Lock()
 	requestErr := body.err
