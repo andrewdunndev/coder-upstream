@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"cdr.dev/slog/v3/sloggers/slogtest"
+	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/aibridge/config"
 	"github.com/coder/coder/v2/aibridge/internal/testutil"
 	"github.com/coder/coder/v2/aibridge/keypool"
@@ -31,6 +33,16 @@ type keyPoolProvider struct {
 }
 
 func (p keyPoolProvider) KeyPool() *keypool.Pool { return p.pool }
+
+func newRouterGate(t *testing.T) *aibridge.InflightGate {
+	t.Helper()
+	gate := aibridge.NewInflightGate(slogtest.Make(t, nil))
+	t.Cleanup(func() {
+		require.NoError(t, gate.Shutdown(context.Background()))
+		gate.Close()
+	})
+	return gate
+}
 
 func TestNewRouterValidatesProviders(t *testing.T) {
 	t.Parallel()
@@ -58,7 +70,7 @@ func TestNewRouterValidatesProviders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			router, err := proxy.NewRouter(tc.providers, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()))
+			router, err := proxy.NewRouter(tc.providers, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
 			if tc.errContains != "" {
 				require.ErrorContains(t, err, tc.errContains)
 				require.Nil(t, router)
@@ -86,7 +98,7 @@ func TestRouterDisabledProvider(t *testing.T) {
 	}
 	router, err := proxy.NewRouter(
 		[]provider.Provider{enabled, provider.NewDisabledStub("disabled-openai", "openai")},
-		slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()),
+		slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t),
 	)
 	require.NoError(t, err)
 
@@ -109,7 +121,7 @@ func TestRouterDisabledProvider(t *testing.T) {
 			t.Parallel()
 
 			resp := httptest.NewRecorder()
-			router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, tc.path, nil))
+			router.Serve(resp, httptest.NewRequest(http.MethodPost, tc.path, nil), nil)
 
 			assert.Equal(t, tc.wantStatus, resp.Code)
 			assert.Contains(t, resp.Body.String(), tc.wantBody)
@@ -149,7 +161,7 @@ func TestRouterRegistersProviderRoutes(t *testing.T) {
 		Bridged: []string{"/messages", "/models/bridged"}, Passthrough: []string{"/models", "/models/", "/tokens"},
 	}
 	m := metrics.NewMetrics(prometheus.NewRegistry())
-	router, err := proxy.NewRouter([]provider.Provider{prov}, slogtest.Make(t, nil), m, noop.NewTracerProvider().Tracer(t.Name()))
+	router, err := proxy.NewRouter([]provider.Provider{prov}, slogtest.Make(t, nil), m, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
 	require.NoError(t, err)
 
 	for _, path := range []string{"/messages", "/models/bridged", "/models", "/tokens"} {
@@ -161,7 +173,7 @@ func TestRouterRegistersProviderRoutes(t *testing.T) {
 			req.Header.Set("User-Agent", "client/1.0")
 		}
 		response := httptest.NewRecorder()
-		router.ServeHTTP(response, req)
+		router.Serve(response, req, nil)
 		if path == "/messages" || path == "/models/bridged" {
 			require.Equal(t, http.StatusNotFound, response.Code)
 			require.Equal(t, "404 page not found\n", response.Body.String())
@@ -193,7 +205,7 @@ func TestRouterSnapshotsProviders(t *testing.T) {
 		keyPoolProvider{Provider: provider.NewDisabledStub("disabled-openai", "openai"), pool: pool},
 	}
 
-	router, err := proxy.NewRouter(providers, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()))
+	router, err := proxy.NewRouter(providers, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
 	require.NoError(t, err)
 
 	// Replace the caller's entry with a provider the router never saw.
@@ -208,11 +220,11 @@ key_pool_state{provider="openai",state="permanent"} 0
 `), "key_pool_state"))
 
 	resp := httptest.NewRecorder()
-	router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/disabled-openai/v1/models", nil))
+	router.Serve(resp, httptest.NewRequest(http.MethodPost, "/disabled-openai/v1/models", nil), nil)
 	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
 
 	resp = httptest.NewRecorder()
-	router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/swapped/v1/models", nil))
+	router.Serve(resp, httptest.NewRequest(http.MethodPost, "/swapped/v1/models", nil), nil)
 	assert.Equal(t, http.StatusNotFound, resp.Code)
 }
 
@@ -222,7 +234,7 @@ func TestRouterDisabledProviderOversizedBody(t *testing.T) {
 
 	router, err := proxy.NewRouter(
 		[]provider.Provider{provider.NewDisabledStub("disabled-openai", "openai")},
-		slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()),
+		slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t),
 	)
 	require.NoError(t, err)
 
@@ -230,7 +242,7 @@ func TestRouterDisabledProviderOversizedBody(t *testing.T) {
 	req.ContentLength = routing.MaxRequestBodyBytes + 1
 
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
+	router.Serve(rec, req, nil)
 
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Contains(t, rec.Body.String(), routing.ErrorCodeProviderDisabled)
