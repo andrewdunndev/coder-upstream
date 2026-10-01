@@ -6,16 +6,22 @@ title: Monitoring
 > AI Gateway is part of [AI Governance](../ai-governance.md), which is
 > included with a Premium license.
 
-In interception mode, AI Gateway records the last `user` prompt, token usage, model reasoning, and every tool invocation for each intercepted request.
+By default, AI Gateway records the last `user` prompt, token usage, model reasoning, and every tool invocation for each request to an [intercepted route](./reference.md#supported-apis).
 Each capture maps back to the authenticated Coder identity for spend and usage attribution.
 
 > [!WARNING]
-> For bridged requests, which interception mode would intercept, the unsafe `ai-gateway-reverse-proxy` experiment records only when each request starts and ends.
-> It doesn't record token usage, model, prompt, tool, or model reasoning data for those requests, and Coder doesn't backfill that data later.
-> For those requests, the monitoring UI can show a blank model and zero usage, but those values aren't evidence of zero provider spend or complete audit coverage.
-> Budget checks still include spend recorded from other traffic, but they can't account for traffic routed through this experiment.
-> For bridged requests, the experiment also doesn't inject [actor headers](../../admin/setup/configuration-reference.md#send-actor-headers), and it doesn't serve Amazon Bedrock bridged routes.
-> Leave the experiment off, or remove it and restart the embedded Coder server or standalone AI Gateway process, if you require complete monitoring or spend enforcement.
+> The unsafe `ai-gateway-reverse-proxy` experiment switches an AI Gateway process to reverse proxy mode when no MCP servers are configured.
+> [AI Governance cost control](./cost-controls.md) explains when the experiment takes effect, how to confirm the mode, and how to turn it off.
+> In reverse proxy mode, AI Gateway makes a best-effort record of only when each request to an intercepted route starts and ends.
+> It forwards the request even if recording fails, so some requests leave no record.
+> It doesn't record token usage, model, prompt, tool, or model reasoning data for these requests, and Coder doesn't backfill that data later.
+> For these requests, the monitoring UI can show a blank model and zero usage, but those values aren't evidence of zero provider spend or complete audit coverage.
+> Reverse proxy mode also changes how intercepted routes behave:
+>
+> - Requests to Amazon Bedrock providers return `404 page not found`.
+> - Requests to Anthropic providers that would authenticate with AWS credentials, such as Claude Platform for AWS or the `CODER_AI_GATEWAY_BEDROCK_*` settings, return `501 Not Implemented`.
+> - AI Gateway doesn't add [actor headers](../../admin/setup/configuration-reference.md#send-actor-headers), and it forwards client-supplied values at custom actor header names unchanged.
+>   Upstream proxies and providers must not trust those headers as user identity.
 
 ![User Prompt logging](../../images/aibridge/grafana_user_prompts_logging.png)
 

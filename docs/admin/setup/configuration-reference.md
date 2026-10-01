@@ -344,7 +344,7 @@ Maximum number of AI Gateway requests per second per replica. Set to 0 to disabl
 
 ### Send actor headers
 
-Add configured headers identifying the authenticated user to intercepted upstream requests. Use this when a proxy between AI Gateway and an upstream AI provider needs user identity. When enabled, removes client-supplied headers at configured actor-header destinations before adding authenticated values. Client headers starting with X-AI-Bridge-Actor are always removed. This option has no effect when AI Gateway runs in reverse proxy mode.
+Add configured headers identifying the authenticated user to intercepted upstream requests. Use this when a proxy between AI Gateway and an upstream AI provider needs user identity. When enabled, removes client-supplied headers at configured actor-header destinations before adding authenticated values. Client headers starting with X-AI-Bridge-Actor are always removed. When the ai-gateway-reverse-proxy experiment selects reverse proxy mode, this option has no effect on intercepted routes: AI Gateway adds no actor headers and forwards client-supplied values at configured actor-header destinations unchanged, so upstream systems must not trust those headers as user identity.
 
 - Environment variable: `CODER_AI_GATEWAY_SEND_ACTOR_HEADERS`
 - CLI flag: [`--ai-gateway-send-actor-headers`](../../reference/cli/server/index.md#--ai-gateway-send-actor-headers)
