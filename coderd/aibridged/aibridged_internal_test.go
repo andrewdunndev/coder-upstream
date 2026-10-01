@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -19,56 +20,289 @@ import (
 	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/aibridge/config"
+	aibcontext "github.com/coder/coder/v2/aibridge/context"
 	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/x/proxy"
+	"github.com/coder/coder/v2/coderd/aibridged/proto"
 	"github.com/coder/coder/v2/codersdk"
 	"github.com/coder/coder/v2/testutil"
 )
 
 func TestNewRecorder(t *testing.T) {
 	t.Parallel()
-	for _, options := range []PoolOptions{
-		{},
-		{StructuredLogging: true},
-		{DisableContentRecording: true},
-		{StructuredLogging: true, DisableContentRecording: true},
+	clientErr := xerrors.New("client unavailable")
+	for _, tc := range []struct {
+		structuredLogging       bool
+		disableContentRecording bool
+		wantClientCalls         int
+		wantLogs                int
+		wantContentErr          error
+	}{
+		{
+			wantClientCalls: 6,
+			wantContentErr:  clientErr,
+		},
+		{
+			structuredLogging: true,
+			wantClientCalls:   6,
+			wantLogs:          6,
+			wantContentErr:    clientErr,
+		},
+		{
+			disableContentRecording: true,
+			wantClientCalls:         3,
+		},
+		{
+			structuredLogging:       true,
+			disableContentRecording: true,
+			wantClientCalls:         3,
+			wantLogs:                6,
+		},
 	} {
-		t.Run(fmt.Sprintf("Structured=%t/DisableContent=%t", options.StructuredLogging, options.DisableContentRecording), func(t *testing.T) {
+		t.Run(fmt.Sprintf("Structured=%t/DisableContent=%t", tc.structuredLogging, tc.disableContentRecording), func(t *testing.T) {
 			t.Parallel()
-			apiKeyID, id := uuid.NewString(), uuid.NewString()
+			request := newIdentityRequest("policy")
 			now := time.Now().UTC()
-			clientErr := xerrors.New("client unavailable")
-			contentErr, contentCalls := clientErr, 1
-			if options.DisableContentRecording {
-				contentErr, contentCalls = nil, 0
-			}
-			type contextKey struct{}
 			sink := testutil.NewFakeSink(t)
 			clientCalls := 0
-			rec := newRecorder(sink.Logger(), noop.NewTracerProvider().Tracer(t.Name()), apiKeyID, options, func(ctx context.Context) (DRPCClient, error) {
+			rec := newRecorder(sink.Logger(), noop.NewTracerProvider().Tracer(t.Name()), tc.structuredLogging, tc.disableContentRecording, func(ctx context.Context) (DRPCClient, error) {
 				clientCalls++
-				require.Equal(t, "record context", ctx.Value(contextKey{}))
+				require.Equal(t, request.interceptionID, ctx.Value(recordContextKey{}), "the client must be acquired with the record call's context")
 				return nil, clientErr
 			})
 			require.Zero(t, clientCalls, "creating a recorder must not acquire a client")
-			ctx := context.WithValue(t.Context(), contextKey{}, "record context")
-			require.ErrorIs(t, rec.RecordInterception(ctx, &recorder.InterceptionRecord{ID: id, StartedAt: now}), clientErr)
+			ctx := request.withActor(t.Context())
+			id := request.interceptionID
+			require.ErrorIs(t, rec.RecordInterception(ctx, request.record(now)), clientErr)
 			require.ErrorIs(t, rec.RecordInterceptionEnded(ctx, &recorder.InterceptionRecordEnded{ID: id, EndedAt: now}), clientErr)
 			require.ErrorIs(t, rec.RecordTokenUsage(ctx, &recorder.TokenUsageRecord{InterceptionID: id, CreatedAt: now, Input: 1}), clientErr)
-			require.ErrorIs(t, rec.RecordPromptUsage(ctx, &recorder.PromptUsageRecord{InterceptionID: id, CreatedAt: now, Prompt: "prompt"}), contentErr)
-			require.ErrorIs(t, rec.RecordToolUsage(ctx, &recorder.ToolUsageRecord{InterceptionID: id, CreatedAt: now, Tool: "tool"}), contentErr)
-			require.ErrorIs(t, rec.RecordModelThought(ctx, &recorder.ModelThoughtRecord{InterceptionID: id, CreatedAt: now, Content: "thought"}), contentErr)
-			require.Equal(t, 3+3*contentCalls, clientCalls, "each forwarded record acquires its own client")
-			logs := sink.Entries(func(entry slog.SinkEntry) bool { return entry.Message == recorder.InterceptionLogMarker })
-			if options.StructuredLogging {
-				require.Len(t, logs, 6, "logging must precede content filtering")
-			} else {
-				require.Empty(t, logs)
+			require.ErrorIs(t, rec.RecordPromptUsage(ctx, &recorder.PromptUsageRecord{InterceptionID: id, CreatedAt: now, Prompt: "prompt"}), tc.wantContentErr)
+			require.ErrorIs(t, rec.RecordToolUsage(ctx, &recorder.ToolUsageRecord{InterceptionID: id, CreatedAt: now, Tool: "tool"}), tc.wantContentErr)
+			require.ErrorIs(t, rec.RecordModelThought(ctx, &recorder.ModelThoughtRecord{InterceptionID: id, CreatedAt: now, Content: "thought"}), tc.wantContentErr)
+			require.Equal(t, tc.wantClientCalls, clientCalls, "each forwarded record acquires its own client")
+			logs := structuredRecordLogs(sink)
+			require.Len(t, logs, tc.wantLogs, "logging must precede content filtering")
+			for _, fields := range logs {
+				if fields["record_type"] == recorder.RecordTypeInterceptionStart {
+					require.Equal(t, request.actor.APIKeyID, fields["api_key_id"])
+				}
 			}
 			require.ErrorIs(t, rec.RecordPromptUsage(ctx, &recorder.PromptUsageRecord{}), recorder.ErrInvalidRecord, "validation must precede content filtering")
-			require.Equal(t, 3+3*contentCalls, clientCalls)
+			require.Equal(t, tc.wantClientCalls, clientCalls)
 		})
 	}
+
+	// One recorder serves every request, so each interception start must carry
+	// its own request's identity, including under concurrency.
+	t.Run("SharedAcrossRequests", func(t *testing.T) {
+		t.Parallel()
+		sink := testutil.NewFakeSink(t)
+		client := &recordingClient{}
+		rec := newRecorder(sink.Logger(), noop.NewTracerProvider().Tracer(t.Name()), true, false, client.acquire)
+		requests := make([]identityRequest, 24)
+		for i := range requests {
+			requests[i] = newIdentityRequest(fmt.Sprintf("user-%d", i))
+		}
+		const sequential = 4
+		for _, request := range requests[:sequential] {
+			require.NoError(t, rec.RecordInterception(request.withActor(t.Context()), request.record(time.Now().UTC())))
+		}
+		start := make(chan struct{})
+		errs := make(chan error, len(requests)-sequential)
+		var wg sync.WaitGroup
+		for _, request := range requests[sequential:] {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				errs <- rec.RecordInterception(request.withActor(t.Context()), request.record(time.Now().UTC()))
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		requireRecordedIdentities(t, sink, client, requests...)
+	})
+
+	t.Run("MissingIdentity", func(t *testing.T) {
+		t.Parallel()
+		now := time.Now().UTC()
+		sink := testutil.NewFakeSink(t)
+		client := &recordingClient{}
+		rec := newRecorder(sink.Logger(), noop.NewTracerProvider().Tracer(t.Name()), true, false, client.acquire)
+		valid := newIdentityRequest("valid")
+		require.NoError(t, rec.RecordInterception(valid.withActor(t.Context()), valid.record(now)))
+
+		noActor := newIdentityRequest("no-actor")
+		emptyKey := newIdentityRequest("empty-key")
+		emptyKey.actor.APIKeyID = ""
+		for name, ctx := range map[string]context.Context{
+			"NoActor":       context.WithValue(t.Context(), recordContextKey{}, noActor.interceptionID),
+			"EmptyAPIKeyID": emptyKey.withActor(t.Context()),
+		} {
+			// A previously recorded identity must not be reused as a fallback.
+			err := rec.RecordInterception(ctx, &recorder.InterceptionRecord{ID: uuid.NewString(), InitiatorID: uuid.NewString(), StartedAt: now})
+			require.ErrorIs(t, err, recorder.ErrMissingAPIKeyID, name)
+		}
+		requireRecordedIdentities(t, sink, client, valid)
+
+		// Only interception starts carry an API-key ID; other records do not
+		// require an identity.
+		require.NoError(t, rec.RecordInterceptionEnded(t.Context(), &recorder.InterceptionRecordEnded{ID: valid.interceptionID, EndedAt: now}))
+		snapshot := client.snapshot()
+		require.Len(t, snapshot.ended, 1)
+		require.Equal(t, valid.interceptionID, snapshot.ended[0].GetId())
+	})
+
+	t.Run("DetachedContext", func(t *testing.T) {
+		t.Parallel()
+		sink := testutil.NewFakeSink(t)
+		client := &recordingClient{}
+		rec := newRecorder(sink.Logger(), noop.NewTracerProvider().Tracer(t.Name()), true, false, client.acquire)
+		request := newIdentityRequest("detached")
+		ctx, cancel := context.WithCancel(request.withActor(t.Context()))
+		cancel()
+		require.NoError(t, rec.RecordInterception(context.WithoutCancel(ctx), request.record(time.Now().UTC())))
+		requireRecordedIdentities(t, sink, client, request)
+		require.NoError(t, client.snapshot().acquisitions[0].Err(), "a detached record context must not carry the request's cancellation")
+	})
+}
+
+type recordContextKey struct{}
+
+// identityRequest is one authenticated request's identity and interception.
+type identityRequest struct {
+	actor          aibridge.Actor
+	interceptionID string
+}
+
+func newIdentityRequest(username string) identityRequest {
+	return identityRequest{
+		actor: aibridge.Actor{
+			ID:       uuid.New(),
+			APIKeyID: uuid.NewString(),
+			Username: username,
+			Email:    username + "@example.test",
+		},
+		interceptionID: uuid.NewString(),
+	}
+}
+
+// withActor attaches the actor and tags the context with the interception ID,
+// so client acquisitions can be traced back to their record call.
+func (r identityRequest) withActor(parent context.Context) context.Context {
+	return aibridge.AsActor(context.WithValue(parent, recordContextKey{}, r.interceptionID), r.actor)
+}
+
+func (r identityRequest) record(startedAt time.Time) *recorder.InterceptionRecord {
+	return &recorder.InterceptionRecord{ID: r.interceptionID, InitiatorID: r.actor.ID.String(), StartedAt: startedAt}
+}
+
+// requireRecordedIdentities asserts that exactly the given interception starts
+// were acquired, sent and logged, each with its own request's identity.
+func requireRecordedIdentities(t *testing.T, sink *testutil.FakeSink, client *recordingClient, requests ...identityRequest) {
+	t.Helper()
+	want := make(map[string]aibridge.Actor, len(requests))
+	for _, request := range requests {
+		want[request.interceptionID] = request.actor
+	}
+	snapshot := client.snapshot()
+
+	require.Len(t, snapshot.acquisitions, len(want))
+	for _, ctx := range snapshot.acquisitions {
+		interceptionID, ok := ctx.Value(recordContextKey{}).(string)
+		require.True(t, ok, "the client must be acquired with the record call's context")
+		actor := aibcontext.ActorFromContext(ctx)
+		require.NotNil(t, actor)
+		require.Equal(t, want[interceptionID], *actor)
+	}
+
+	require.Len(t, snapshot.interceptions, len(want))
+	for _, in := range snapshot.interceptions {
+		actor, ok := want[in.GetId()]
+		require.True(t, ok, "unexpected interception %q", in.GetId())
+		require.Equal(t, actor.APIKeyID, in.GetApiKeyId())
+		require.Equal(t, actor.ID.String(), in.GetInitiatorId())
+	}
+
+	var starts int
+	for _, fields := range structuredRecordLogs(sink) {
+		if fields["record_type"] != recorder.RecordTypeInterceptionStart {
+			continue
+		}
+		starts++
+		interceptionID, _ := fields["interception_id"].(string)
+		actor, ok := want[interceptionID]
+		require.True(t, ok, "unexpected interception log %q", interceptionID)
+		require.Equal(t, actor.APIKeyID, fields["api_key_id"])
+		require.Equal(t, actor.ID.String(), fields["initiator_id"])
+	}
+	require.Equal(t, len(want), starts)
+}
+
+// structuredRecordLogs returns the fields of each structured record log.
+func structuredRecordLogs(sink *testutil.FakeSink) []map[string]any {
+	entries := sink.Entries(func(entry slog.SinkEntry) bool { return entry.Message == recorder.InterceptionLogMarker })
+	logs := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		fields := make(map[string]any, len(entry.Fields))
+		for _, field := range entry.Fields {
+			fields[field.Name] = field.Value
+		}
+		logs = append(logs, fields)
+	}
+	return logs
+}
+
+// recordingClient captures client acquisitions and interception RPCs. It is
+// safe for concurrent use, and its nil embedded client makes any other call
+// fail loudly.
+type recordingClient struct {
+	DRPCClient
+	mu            sync.Mutex
+	acquisitions  []context.Context
+	interceptions []*proto.RecordInterceptionRequest
+	ended         []*proto.RecordInterceptionEndedRequest
+}
+
+type recordingClientSnapshot struct {
+	acquisitions  []context.Context
+	interceptions []*proto.RecordInterceptionRequest
+	ended         []*proto.RecordInterceptionEndedRequest
+}
+
+func (c *recordingClient) acquire(ctx context.Context) (DRPCClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.acquisitions = append(c.acquisitions, ctx)
+	return c, nil
+}
+
+func (c *recordingClient) snapshot() recordingClientSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return recordingClientSnapshot{
+		acquisitions:  slices.Clone(c.acquisitions),
+		interceptions: slices.Clone(c.interceptions),
+		ended:         slices.Clone(c.ended),
+	}
+}
+
+func (c *recordingClient) RecordInterception(_ context.Context, in *proto.RecordInterceptionRequest) (*proto.RecordInterceptionResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.interceptions = append(c.interceptions, in)
+	return &proto.RecordInterceptionResponse{}, nil
+}
+
+func (c *recordingClient) RecordInterceptionEnded(_ context.Context, in *proto.RecordInterceptionEndedRequest) (*proto.RecordInterceptionEndedResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ended = append(c.ended, in)
+	return &proto.RecordInterceptionEndedResponse{}, nil
 }
 
 // blockingHandler returns a handler that signals started, then blocks until

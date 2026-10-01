@@ -15,7 +15,6 @@ import (
 	"github.com/coder/coder/v2/aibridge/keypool"
 	"github.com/coder/coder/v2/aibridge/metrics"
 	"github.com/coder/coder/v2/aibridge/provider"
-	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/routing"
 )
 
@@ -28,18 +27,14 @@ import (
 //
 // Router is safe for concurrent use.
 type Router struct {
-	routes   []route
-	fallback http.Handler
+	mux *http.ServeMux
 
 	// providers is an owned copy of the provider list, fixed at construction.
 	providers  []provider.Provider
 	transports []*http.Transport
 }
 
-type route struct {
-	pattern string
-	serve   func(http.ResponseWriter, *http.Request, recorder.Recorder)
-}
+var _ http.Handler = (*Router)(nil)
 
 // NewRouter creates a [*Router] for the given providers, whose
 // names must be valid and unique.
@@ -54,7 +49,9 @@ func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Met
 	}
 
 	snapshot := slices.Clone(providers)
-	router := &Router{providers: snapshot, fallback: inflight.Middleware(routing.NewProviderMux(snapshot, logger))}
+	mux := http.NewServeMux()
+	mux.Handle("/", inflight.Middleware(routing.NewProviderMux(snapshot, logger)))
+	router := &Router{providers: snapshot, mux: mux}
 	for _, prov := range snapshot {
 		if !prov.Enabled() {
 			continue
@@ -66,9 +63,7 @@ func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Met
 			if err != nil {
 				return nil, xerrors.Errorf("configure provider %q bridged route: %w", prov.Name(), err)
 			}
-			router.routes = append(router.routes, route{pattern: pattern, serve: func(w http.ResponseWriter, r *http.Request, _ recorder.Recorder) {
-				bridged.ServeHTTP(w, r)
-			}})
+			mux.Handle(pattern, bridged)
 		}
 
 		passthrough := inflight.Middleware(http.StripPrefix(prov.RoutePrefix(), aibridge.NewPassthroughRouter(prov, logger.Named(fmt.Sprintf("passthrough.%s", prov.Name())), m, tracer)))
@@ -77,37 +72,20 @@ func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Met
 			if err != nil {
 				return nil, xerrors.Errorf("configure provider %q passthrough route: %w", prov.Name(), err)
 			}
-			router.routes = append(router.routes, route{pattern: pattern, serve: func(w http.ResponseWriter, r *http.Request, _ recorder.Recorder) {
-				passthrough.ServeHTTP(w, r)
-			}})
+			mux.Handle(pattern, passthrough)
 		}
 	}
 
-	// Detect conflicting route patterns at construction, not while serving.
-	_ = router.requestMux(nil)
 	return router, nil
 }
 
-// Serve dispatches a request with its authenticated recorder. Each handler owns
-// its admission lifetime. Passthrough routes do not need rec.
-func (p *Router) Serve(rw http.ResponseWriter, r *http.Request, rec recorder.Recorder) {
+// ServeHTTP dispatches a request through the provider snapshot's shared mux.
+// Authentication and actor identity are supplied by the caller on r.Context().
+func (p *Router) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	if r.Body != nil && r.Body != http.NoBody {
 		r.Body = http.MaxBytesReader(rw, r.Body, routing.MaxRequestBodyBytes)
 	}
-	p.requestMux(rec).ServeHTTP(rw, r)
-}
-
-// requestMux binds the recorder without storing request state on shared handlers.
-// Only the routing shell is request-local; provider handlers and transports are reused.
-func (p *Router) requestMux(rec recorder.Recorder) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.Handle("/", p.fallback)
-	for _, route := range p.routes {
-		mux.HandleFunc(route.pattern, func(w http.ResponseWriter, r *http.Request) {
-			route.serve(w, r, rec)
-		})
-	}
-	return mux
+	p.mux.ServeHTTP(rw, r)
 }
 
 // KeyPools returns the non-nil key pools from this router's provider snapshot.

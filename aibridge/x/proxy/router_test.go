@@ -121,7 +121,7 @@ func TestRouterDisabledProvider(t *testing.T) {
 			t.Parallel()
 
 			resp := httptest.NewRecorder()
-			router.Serve(resp, httptest.NewRequest(http.MethodPost, tc.path, nil), nil)
+			router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, tc.path, nil))
 
 			assert.Equal(t, tc.wantStatus, resp.Code)
 			assert.Contains(t, resp.Body.String(), tc.wantBody)
@@ -173,7 +173,7 @@ func TestRouterRegistersProviderRoutes(t *testing.T) {
 			req.Header.Set("User-Agent", "client/1.0")
 		}
 		response := httptest.NewRecorder()
-		router.Serve(response, req, nil)
+		router.ServeHTTP(response, req)
 		if path == "/messages" || path == "/models/bridged" {
 			require.Equal(t, http.StatusNotFound, response.Code)
 			require.Equal(t, "404 page not found\n", response.Body.String())
@@ -220,11 +220,11 @@ key_pool_state{provider="openai",state="permanent"} 0
 `), "key_pool_state"))
 
 	resp := httptest.NewRecorder()
-	router.Serve(resp, httptest.NewRequest(http.MethodPost, "/disabled-openai/v1/models", nil), nil)
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/disabled-openai/v1/models", nil))
 	assert.Equal(t, http.StatusServiceUnavailable, resp.Code)
 
 	resp = httptest.NewRecorder()
-	router.Serve(resp, httptest.NewRequest(http.MethodPost, "/swapped/v1/models", nil), nil)
+	router.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/swapped/v1/models", nil))
 	assert.Equal(t, http.StatusNotFound, resp.Code)
 }
 
@@ -242,7 +242,7 @@ func TestRouterDisabledProviderOversizedBody(t *testing.T) {
 	req.ContentLength = routing.MaxRequestBodyBytes + 1
 
 	rec := httptest.NewRecorder()
-	router.Serve(rec, req, nil)
+	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 	assert.Contains(t, rec.Body.String(), routing.ErrorCodeProviderDisabled)

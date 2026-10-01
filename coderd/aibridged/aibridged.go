@@ -16,6 +16,7 @@ import (
 	"cdr.dev/slog/v3"
 	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/aibridge/keypool"
+	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/x/proxy"
 	"github.com/coder/coder/v2/coderd/aibridged/proto"
 	"github.com/coder/coder/v2/codersdk"
@@ -336,10 +337,7 @@ func (s *Server) GetRequestHandler(ctx context.Context, req Request) (http.Handl
 	if current.router == nil {
 		return http.HandlerFunc(notReadyHandler), nil
 	}
-	rec := newRecorder(s.logger, s.tracer, req.APIKeyID, s.poolOptions, s.Client)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		current.router.Serve(w, r, rec)
-	}), nil
+	return current.router, nil
 }
 
 // Ready reports whether the server currently has an active DRPC connection to coderd.
@@ -389,6 +387,28 @@ func (s *Server) ReplaceProviders(ctx context.Context, providers []aibridge.Prov
 		router.CloseIdleConnections()
 	}
 	return nil
+}
+
+// newRecorder builds a reusable recorder that reads identity from each call's
+// actor context and acquires the DRPC client with that call's context.
+//
+// revive:disable-next-line:flag-parameter // Constructor configuration flags.
+func newRecorder(logger slog.Logger, tracer trace.Tracer, structuredLogging bool, disableContentRecording bool, clientFn ClientFunc) recorder.Recorder {
+	var middleware []recorder.Middleware
+	if disableContentRecording {
+		middleware = append(middleware, recorder.WithoutRecords(recorder.DisabledRecords{
+			PromptUsage:  true,
+			ToolUsage:    true,
+			ModelThought: true,
+		}))
+	}
+	return aibridge.NewRecorder(
+		logger.Named("recorder"), tracer, structuredLogging,
+		recorder.NewDRPCRecorder(func(ctx context.Context) (proto.DRPCRecorderClient, error) {
+			return clientFn(ctx)
+		}),
+		middleware...,
+	)
 }
 
 // PoolOptions reports the options the published interception pool was built

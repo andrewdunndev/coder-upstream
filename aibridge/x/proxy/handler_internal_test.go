@@ -13,50 +13,8 @@ import (
 	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/aibridge/intercept"
 	"github.com/coder/coder/v2/aibridge/internal/testutil"
-	"github.com/coder/coder/v2/aibridge/recorder"
 	"github.com/coder/coder/v2/aibridge/routing"
 )
-
-func TestRouterRecorderDispatch(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		path   string
-		status int
-	}{
-		{path: "/openai/v1/responses", status: http.StatusOK},
-		{path: "/openai/v1/%72esponses", status: http.StatusOK},
-		{path: "/openai/v1%2Fresponses", status: http.StatusNotFound},
-		{path: "/openai/v1/responses/", status: http.StatusNotFound},
-		{path: "/openai/v1//responses", status: http.StatusTemporaryRedirect},
-		{path: "/unknown", status: http.StatusNotFound},
-		{path: "*", status: http.StatusBadRequest},
-	} {
-		t.Run(tc.path, func(t *testing.T) {
-			t.Parallel()
-			expected := &struct{ recorder.Recorder }{}
-			called := false
-			router := &Router{fallback: http.NotFoundHandler(), routes: []route{{
-				pattern: "/openai/v1/responses",
-				serve: func(w http.ResponseWriter, r *http.Request, rec recorder.Recorder) {
-					called = true
-					require.Same(t, expected, rec)
-					require.Equal(t, "/openai/v1/responses", r.Pattern)
-					w.WriteHeader(http.StatusOK)
-				},
-			}}}
-			req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
-			if tc.path == "*" {
-				req.URL.Path, req.RequestURI = tc.path, tc.path
-			} else {
-				req = httptest.NewRequest(http.MethodPost, tc.path, nil)
-			}
-			response := httptest.NewRecorder()
-			router.Serve(response, req, expected)
-			require.Equal(t, tc.status, response.Code)
-			require.Equal(t, tc.status == http.StatusOK, called)
-		})
-	}
-}
 
 func TestForwardingHandlerPlaceholder(t *testing.T) {
 	t.Parallel()

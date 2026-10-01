@@ -2965,9 +2965,7 @@ func TestActorHeaders(t *testing.T) {
 				metadataKey := "Username"
 				bridgeServer := newBridgeTestServer(ctx, t, upstream.URL,
 					withCustomProvider(tc.createProviderFn(upstream.URL, apiKey, send)),
-					withActor(defaultActorID, recorder.Metadata{
-						metadataKey: actorUsername,
-					}),
+					withActor(defaultActorUUID, actorUsername),
 				)
 
 				// Add the stream param to the request.

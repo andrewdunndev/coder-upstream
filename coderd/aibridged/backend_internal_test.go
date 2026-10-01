@@ -278,7 +278,7 @@ func TestReplaceProvidersDuringShutdownKeepsAdmissionClosed(t *testing.T) {
 	}{
 		{name: "Retained", handler: retained},
 		{name: "CurrentSnapshot", handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			server.backend.Load().router.Serve(w, r, nil)
+			server.backend.Load().router.ServeHTTP(w, r)
 		})},
 		{name: "AcquiredAfterShutdown", handler: acquired},
 	} {
