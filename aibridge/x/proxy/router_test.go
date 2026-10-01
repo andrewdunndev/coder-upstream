@@ -272,29 +272,86 @@ func TestRouterRecordedForwardingIsolation(t *testing.T) {
 	})
 }
 
+func TestRouterBridgedRejectsRequest(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		actor    bool
+		shutdown bool
+		status   int
+		body     string
+	}{
+		{name: "Rejected", status: http.StatusBadRequest, body: "no actor found\n"},
+		{name: "AfterShutdown", actor: true, shutdown: true, status: http.StatusServiceUnavailable, body: "AI Gateway is shutting down\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+			t.Cleanup(upstream.Close)
+			gate := newRouterGate(t)
+			router, err := proxy.NewRouter([]provider.Provider{provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL})}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), gate)
+			require.NoError(t, err)
+			t.Cleanup(router.CloseIdleConnections)
+			if tc.shutdown {
+				require.NoError(t, gate.Shutdown(t.Context()))
+			}
+			req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+			if tc.actor {
+				req = req.WithContext(aibcontext.AsActor(t.Context(), t.Name(), "", nil))
+			}
+			req.Header.Set("Authorization", "Bearer user-key")
+			rec := &routerRecorder{done: make(chan struct{})}
+			response := httptest.NewRecorder()
+			router.Serve(response, req, rec)
+			require.Equal(t, tc.status, response.Code)
+			require.Equal(t, tc.body, response.Body.String())
+			require.Zero(t, calls.Load(), "rejected requests must not reach upstream")
+			require.Empty(t, rec.starts)
+			require.Empty(t, rec.ends)
+		})
+	}
+}
+
 func TestRouterBedrockBridgedRemainsDisabled(t *testing.T) {
 	t.Parallel()
-	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("Bedrock forwarding is not supported")
-	}))
-	t.Cleanup(upstream.Close)
-	prov, err := provider.NewBedrock(t.Context(), config.Anthropic{BaseURL: upstream.URL}, config.AWSBedrock{
-		Region: "us-east-1", AccessKey: "test-key", AccessKeySecret: "test-secret",
-		Model: "test-model", SmallFastModel: "test-small-model",
-	})
-	require.NoError(t, err)
-	router, err := proxy.NewRouter([]provider.Provider{prov}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
-	require.NoError(t, err)
-	t.Cleanup(router.CloseIdleConnections)
-	rec := &routerRecorder{}
-	ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
-	for _, route := range prov.BridgedRoutes() {
-		response := httptest.NewRecorder()
-		router.Serve(response, httptest.NewRequest(http.MethodPost, prov.RoutePrefix()+route, nil).WithContext(ctx), rec)
-		require.Equal(t, http.StatusNotFound, response.Code)
+	for _, tc := range []struct {
+		name          string
+		authorization string
+	}{
+		{name: "NoAuth"},
+		{name: "BYOK", authorization: "Bearer user-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+			t.Cleanup(upstream.Close)
+			prov, err := provider.NewBedrock(t.Context(), config.Anthropic{BaseURL: upstream.URL}, config.AWSBedrock{
+				Region: "us-east-1", AccessKey: "test-key", AccessKeySecret: "test-secret",
+				Model: "test-model", SmallFastModel: "test-small-model",
+			})
+			require.NoError(t, err)
+			router, err := proxy.NewRouter([]provider.Provider{prov}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
+			require.NoError(t, err)
+			t.Cleanup(router.CloseIdleConnections)
+			ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
+			for _, route := range prov.BridgedRoutes() {
+				req := httptest.NewRequest(http.MethodPost, prov.RoutePrefix()+route, nil).WithContext(ctx)
+				if tc.authorization != "" {
+					req.Header.Set("Authorization", tc.authorization)
+				}
+				rec := &routerRecorder{done: make(chan struct{})}
+				response := httptest.NewRecorder()
+				router.Serve(response, req, rec)
+				require.Equal(t, http.StatusNotFound, response.Code)
+				require.Equal(t, "404 page not found\n", response.Body.String())
+				require.Empty(t, rec.starts)
+				require.Empty(t, rec.ends)
+			}
+			require.Zero(t, calls.Load(), "Bedrock forwarding is not supported")
+		})
 	}
-	require.Empty(t, rec.starts)
-	require.Empty(t, rec.ends)
 }
 
 // TestRouterSnapshotsProviders asserts the router routes and reports key

@@ -87,7 +87,9 @@ func PoolOptionsFromConfig(ctx context.Context, logger slog.Logger, cfg codersdk
 	return options
 }
 
-// newRecorder applies the same record policy in interception and proxy modes.
+// newRecorder builds the recorder for one API key. Records are logged and
+// validated before DisableContentRecording drops prompt, tool and model thought
+// records, and every forwarded record acquires its client through clientFn.
 func newRecorder(logger slog.Logger, tracer trace.Tracer, apiKeyID string, options PoolOptions, clientFn ClientFunc) recorder.Recorder {
 	var middleware []recorder.Middleware
 	if options.DisableContentRecording {
@@ -100,8 +102,8 @@ func newRecorder(logger slog.Logger, tracer trace.Tracer, apiKeyID string, optio
 	return aibridge.NewRecorder(
 		logger.Named("recorder"), tracer, apiKeyID, options.StructuredLogging,
 		recorder.NewDRPCRecorder(apiKeyID, func(ctx context.Context) (proto.DRPCRecorderClient, error) {
-			// Acquire the client against each record's context, not the context
-			// used to construct the handler, which the recorder can outlive.
+			// The recorder outlives its caller, so acquire the client with each
+			// record call's context.
 			return clientFn(ctx)
 		}),
 		middleware...,
