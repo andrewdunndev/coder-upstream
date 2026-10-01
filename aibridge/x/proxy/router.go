@@ -49,13 +49,18 @@ type route struct {
 // under its name. Enabled providers use the existing passthrough handler for
 // passthrough routes; bridged routes validate requests but still return 404.
 // All snapshots share the server's inflight gate so shutdown drains their requests.
-func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Metrics, tracer trace.Tracer, inflight *aibridge.InflightGate) (*Router, error) {
+func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Metrics, tracer trace.Tracer, inflight *aibridge.InflightGate) (_ *Router, outErr error) {
 	if err := provider.ValidateProviders(providers); err != nil {
 		return nil, err
 	}
 
 	snapshot := slices.Clone(providers)
 	router := &Router{providers: snapshot, fallback: inflight.Middleware(routing.NewProviderMux(snapshot, logger))}
+	defer func() {
+		if outErr != nil {
+			router.CloseIdleConnections()
+		}
+	}()
 	for _, prov := range snapshot {
 		if !prov.Enabled() {
 			continue
@@ -64,7 +69,12 @@ func NewRouter(providers []provider.Provider, logger slog.Logger, m *metrics.Met
 		notFound := inflight.Middleware(http.NotFoundHandler())
 		bridged := func(w http.ResponseWriter, r *http.Request, _ recorder.Recorder) { notFound.ServeHTTP(w, r) }
 		if prov.Type() != config.ProviderBedrock && len(prov.BridgedRoutes()) > 0 {
-			bridged = newForwardingHandler(prov, logger, tracer, inflight).serve
+			handler, transport, err := newForwardingHandler(prov, logger, m, tracer, inflight)
+			if err != nil {
+				return nil, err
+			}
+			bridged = handler.serve
+			router.transports = append(router.transports, transport)
 		}
 		for _, path := range prov.BridgedRoutes() {
 			pattern, err := url.JoinPath(prov.RoutePrefix(), path)
