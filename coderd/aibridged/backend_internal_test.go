@@ -42,6 +42,7 @@ func TestServerKeyPoolStateCollector(t *testing.T) {
 	}
 
 	var server Server
+	server.inflight = aibridge.NewInflightGate(slogtest.Make(t, nil))
 	registry := prometheus.NewRegistry()
 	require.NoError(t, registry.Register(server.KeyPoolStateCollector()))
 
@@ -56,7 +57,7 @@ func TestServerKeyPoolStateCollector(t *testing.T) {
 	pool, err := NewCachedBridgePool(DefaultPoolOptions, []aibridge.Provider{firstProvider}, slogtest.Make(t, nil), nil, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = pool.Shutdown(context.Background()) })
-	server.backend.Store(&backend{pool: pool, keyPools: pool.KeyPools})
+	server.backend.Store(&backend{pool: pool})
 
 	metrics := gather(t, registry)
 	require.True(t, testutil.PromGaugeHasValue(t, metrics, 1, "key_pool_state", "first", "valid"))
@@ -71,18 +72,18 @@ func TestServerKeyPoolStateCollector(t *testing.T) {
 	// Replacing proxy snapshots similarly changes the output without
 	// registering another collector.
 	thirdProvider := newProvider(t, "third")
-	firstRouter, err := proxy.NewRouter([]aibridge.Provider{thirdProvider}, slogtest.Make(t, nil), nil, otel.Tracer(t.Name()))
+	firstRouter, err := proxy.NewRouter([]aibridge.Provider{thirdProvider}, slogtest.Make(t, nil), nil, otel.Tracer(t.Name()), server.inflight)
 	require.NoError(t, err)
-	server.backend.Store(&backend{proxyRouter: firstRouter, keyPools: firstRouter.KeyPools})
+	server.backend.Store(&backend{router: firstRouter})
 
 	metrics = gather(t, registry)
 	require.False(t, testutil.PromGaugeGathered(t, metrics, "key_pool_state", "second", "valid"))
 	require.True(t, testutil.PromGaugeHasValue(t, metrics, 1, "key_pool_state", "third", "valid"))
 
 	fourthProvider := newProvider(t, "fourth")
-	secondRouter, err := proxy.NewRouter([]aibridge.Provider{fourthProvider}, slogtest.Make(t, nil), nil, otel.Tracer(t.Name()))
+	secondRouter, err := proxy.NewRouter([]aibridge.Provider{fourthProvider}, slogtest.Make(t, nil), nil, otel.Tracer(t.Name()), server.inflight)
 	require.NoError(t, err)
-	server.backend.Store(&backend{proxyRouter: secondRouter, keyPools: secondRouter.KeyPools})
+	server.backend.Store(&backend{router: secondRouter})
 
 	metrics = gather(t, registry)
 	require.False(t, testutil.PromGaugeGathered(t, metrics, "key_pool_state", "third", "valid"))
@@ -276,7 +277,9 @@ func TestReplaceProvidersDuringShutdownKeepsAdmissionClosed(t *testing.T) {
 		handler http.Handler
 	}{
 		{name: "Retained", handler: retained},
-		{name: "CurrentSnapshot", handler: server.backend.Load().proxyRouter},
+		{name: "CurrentSnapshot", handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server.backend.Load().router.Serve(w, r, nil)
+		})},
 		{name: "AcquiredAfterShutdown", handler: acquired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

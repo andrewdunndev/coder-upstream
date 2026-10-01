@@ -69,7 +69,7 @@ type Server struct {
 	// cancelFn closes the lifecycleCtx with the reason it closed.
 	cancelFn context.CancelCauseFunc
 
-	// poolOptions configures the interception pool created at startup.
+	// poolOptions configures the interception pool and both modes' record policy.
 	poolOptions PoolOptions
 
 	shutdownOnce sync.Once
@@ -86,12 +86,11 @@ func WithPoolOptions(options PoolOptions) ServerOption {
 }
 
 // backend holds either an interception pool or a proxy router.
-// Its fields are fixed after publication. Both pool and proxyRouter are nil when
-// proxy mode is selected but providers are not yet loaded.
+// Its fields are fixed after publication. Both are nil when proxy mode is
+// selected but providers are not yet loaded.
 type backend struct {
-	pool        Pooler                 // RequestBridge pool.
-	proxyRouter http.Handler           // Proxy router for this snapshot.
-	keyPools    func() []*keypool.Pool // Current key pools for metric scrapes.
+	pool   Pooler
+	router *proxy.Router
 }
 
 // New starts a gateway server. Creates a request pool only when interception
@@ -135,8 +134,9 @@ func New(ctx context.Context, rpcDialer Dialer, logger slog.Logger, tracer trace
 
 // Connect establishes a connection to coderd.
 func (s *Server) connect() {
-	defer s.logger.Debug(s.lifecycleCtx, "connect loop exited")
+	// Log before Done so nothing is logged after Shutdown observes loop exit.
 	defer s.wg.Done()
+	defer s.logger.Debug(s.lifecycleCtx, "connect loop exited")
 	defer func() {
 		if s.lifecycleCtx.Err() == nil {
 			s.cancelFn(xerrors.New("connect loop exited"))
@@ -281,7 +281,7 @@ func (s *Server) initializeInterception() error {
 		_ = pool.Shutdown(context.Background())
 		return s.Err()
 	}
-	s.backend.Store(&backend{pool: pool, keyPools: pool.KeyPools})
+	s.backend.Store(&backend{pool: pool})
 	return nil
 }
 
@@ -333,10 +333,13 @@ func (s *Server) GetRequestHandler(ctx context.Context, req Request) (http.Handl
 	}
 	// Proxy mode serves every request from one handler, which does not exist
 	// until the first provider snapshot arrives.
-	if current.proxyRouter == nil {
+	if current.router == nil {
 		return http.HandlerFunc(notReadyHandler), nil
 	}
-	return current.proxyRouter, nil
+	rec := newRecorder(s.logger, s.tracer, req.APIKeyID, s.poolOptions, s.Client)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current.router.Serve(w, r, rec)
+	}), nil
 }
 
 // Ready reports whether the server currently has an active DRPC connection to coderd.
@@ -372,11 +375,19 @@ func (s *Server) ReplaceProviders(ctx context.Context, providers []aibridge.Prov
 		current.pool.ReplaceProviders(providers)
 		return nil
 	}
-	router, err := proxy.NewRouter(providers, s.logger, s.metrics, s.tracer)
+	router, err := proxy.NewRouter(providers, s.logger, s.metrics, s.tracer, s.inflight)
 	if err != nil {
 		return xerrors.Errorf("create proxy router: %w", err)
 	}
-	s.backend.Store(&backend{proxyRouter: s.inflight.Middleware(router), keyPools: router.KeyPools})
+	s.backend.Store(&backend{router: router})
+	if current.router != nil {
+		current.router.CloseIdleConnections()
+	}
+	// Shutdown does not wait for provider construction. If it raced publication,
+	// release the new snapshot too; the shared admission gate remains closed.
+	if s.isShutdown() {
+		router.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -402,10 +413,16 @@ func (s *Server) KeyPoolStateCollector() prometheus.Collector {
 
 func (s *Server) keyPools() []*keypool.Pool {
 	current := s.backend.Load()
-	if current == nil || current.keyPools == nil {
+	if current == nil {
 		return nil
 	}
-	return current.keyPools()
+	if current.pool != nil {
+		return current.pool.KeyPools()
+	}
+	if current.router != nil {
+		return current.router.KeyPools()
+	}
+	return nil
 }
 
 // isShutdown reports whether shutdown has begun or the connection lifecycle ended.
@@ -420,6 +437,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	var err error
 	s.shutdownOnce.Do(func() {
 		s.shuttingDown.Store(true)
+		defer func() {
+			if current := s.backend.Load(); current != nil && current.router != nil {
+				current.router.CloseIdleConnections()
+			}
+		}()
 
 		// Safe to call in both modes. The proxy gate is idle in interception mode.
 		err = s.inflight.Shutdown(ctx)
