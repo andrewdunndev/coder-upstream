@@ -12,6 +12,7 @@ import (
 	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/aibridge"
 	"github.com/coder/coder/v2/testutil"
+	"github.com/coder/quartz"
 )
 
 // blockingHandler returns a handler that signals started, then blocks until
@@ -160,6 +161,7 @@ func newProxyTestServer(t *testing.T) *Server {
 		cancelFn:     cancel,
 		logger:       slogtest.Make(t, nil),
 		inflight:     aibridge.NewInflightGate(slogtest.Make(t, nil)),
+		sockets:      newSocketRegistry(quartz.NewReal(), nil, defaultSocketLimits),
 	}
 	s.backend.Store(&backend{})
 	t.Cleanup(func() { _ = s.Close() })

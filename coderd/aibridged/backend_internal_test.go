@@ -130,6 +130,7 @@ func TestServerShutdownMode(t *testing.T) {
 				lifecycleCtx: lifecycleCtx, cancelFn: cancel,
 				logger:   slogtest.Make(t, &slogtest.Options{IgnoreErrors: tc.poolErr != nil}),
 				inflight: aibridge.NewInflightGate(slogtest.Make(t, nil)),
+				sockets:  newSocketRegistry(quartz.NewReal(), nil, defaultSocketLimits),
 			}
 			if tc.selected {
 				current := &backend{}
