@@ -197,19 +197,41 @@ passthrough_total{method="GET",provider="test",route="/tokens"} 1
 
 func TestRouterBridgedRemainsStubbed(t *testing.T) {
 	t.Parallel()
-	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("bridged forwarding must remain disabled until lifecycle recording is connected")
-	}))
-	t.Cleanup(upstream.Close)
-	router, err := proxy.NewRouter([]provider.Provider{provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL})}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), newRouterGate(t))
-	require.NoError(t, err)
-	t.Cleanup(router.CloseIdleConnections)
-	ctx := aibcontext.AsActor(t.Context(), t.Name(), "", nil)
-	req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer user-key")
-	response := httptest.NewRecorder()
-	router.Serve(response, req, &struct{ recorder.Recorder }{})
-	require.Equal(t, http.StatusNotFound, response.Code)
+	for _, tc := range []struct {
+		name     string
+		actor    bool
+		shutdown bool
+		status   int
+		body     string
+	}{
+		{name: "Valid", actor: true, status: http.StatusNotFound, body: "404 page not found\n"},
+		{name: "Rejected", status: http.StatusBadRequest, body: "no actor found\n"},
+		{name: "AfterShutdown", actor: true, shutdown: true, status: http.StatusServiceUnavailable, body: "AI Gateway is shutting down\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+			t.Cleanup(upstream.Close)
+			gate := newRouterGate(t)
+			router, err := proxy.NewRouter([]provider.Provider{provider.NewOpenAI(config.OpenAI{BaseURL: upstream.URL})}, slogtest.Make(t, nil), nil, noop.NewTracerProvider().Tracer(t.Name()), gate)
+			require.NoError(t, err)
+			t.Cleanup(router.CloseIdleConnections)
+			if tc.shutdown {
+				require.NoError(t, gate.Shutdown(t.Context()))
+			}
+			req := httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+			if tc.actor {
+				req = req.WithContext(aibcontext.AsActor(t.Context(), t.Name(), "", nil))
+			}
+			req.Header.Set("Authorization", "Bearer user-key")
+			response := httptest.NewRecorder()
+			router.Serve(response, req, &struct{ recorder.Recorder }{})
+			require.Equal(t, tc.status, response.Code)
+			require.Equal(t, tc.body, response.Body.String())
+			require.Zero(t, calls.Load(), "bridged forwarding must remain disabled until lifecycle recording is connected")
+		})
+	}
 }
 
 func TestRouterBedrockBridgedRemainsDisabled(t *testing.T) {
